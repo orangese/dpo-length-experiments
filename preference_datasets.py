@@ -1,4 +1,7 @@
+import re
 import datasets
+import os
+import json
 import torch
 from torch.utils.data import DataLoader, Dataset
 from utils import get_local_dir, TemporarilySeededRandom
@@ -117,6 +120,153 @@ def get_shp(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str
     return data
 
 
+def get_webgpt(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str, Dict[str, Union[List[Tuple[int, int]], List[str], str]]]:
+    print(f'Loading WebGPT dataset ({split}) from Huggingface...')
+    dataset = datasets.load_dataset("openai/webgpt_comparisons", split=split, cache_dir=cache_dir)
+    print('done')
+
+    def split_prompt_and_responses(row):
+        prompt = row["question"]["full_text"]
+        chosen, rejected = row["answer_0"], row["answer_1"]
+        if row["score_1"] > 0:
+            chosen, rejected = rejected, chosen
+        elif row["score_1"] == 0 and random.random() < 0.5:
+            chosen, rejected = rejected, chosen
+        return prompt, chosen, rejected
+
+    data = defaultdict(lambda: defaultdict(list))
+    for row in tqdm.tqdm(dataset, desc='Processing WebGPT', disable=silent):
+        prompt, chosen, rejected = split_prompt_and_responses(row)
+        responses = [chosen, rejected]
+        n_responses = len(data[prompt]['responses'])
+        data[prompt]['pairs'].append((n_responses, n_responses + 1))
+        data[prompt]['responses'].extend(responses)
+        data[prompt]['sft_target'] = chosen
+
+    return data    
+
+
+def get_rlcd(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str, Dict[str, Union[List[Tuple[int, int]], List[str], str]]]:
+    print(f'Loading RLCD dataset ({split}) from Huggingface...')
+    dataset = datasets.load_dataset("TaylorAI/RLCD-generated-preference-data-split", split=split, cache_dir=cache_dir)
+    print('done')
+
+    def split_prompt_and_responses(row):
+        prompt = (row["instruction"] or "") + (row["input"] or "")
+        chosen, rejected = row["output_1"], row["output_2"]
+        if row["preference"] == 2:
+            chosen, rejected = rejected, chosen
+        return prompt, chosen, rejected
+
+    data = defaultdict(lambda: defaultdict(list))
+    for row in tqdm.tqdm(dataset, desc='Processing RLCD', disable=silent):
+        prompt, chosen, rejected = split_prompt_and_responses(row)
+        responses = [chosen, rejected]
+        n_responses = len(data[prompt]['responses'])
+        data[prompt]['pairs'].append((n_responses, n_responses + 1))
+        data[prompt]['responses'].extend(responses)
+        data[prompt]['sft_target'] = chosen
+
+    return data    
+
+
+def get_alpaca(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str, Dict[str, Union[List[Tuple[int, int]], List[str], str]]]:
+    """Load the AlpacaFarm dataset."""
+    print(f'Loading AlpacaFarm dataset (split=all, ignoring arg) locally...')
+    with open(os.path.join("data/farm/alpaca_human_preference.json"), 'r') as f:
+        dataset = json.load(f)
+    print('done')
+
+    def split_prompt_and_responses(row):
+        prompt = row["instruction"] + row["input"]
+        chosen, rejected = row["output_1"], row["output_2"]
+        if row["preference"] == 2:
+            chosen, rejected = rejected, chosen
+        return prompt, chosen, rejected
+
+    data = defaultdict(lambda: defaultdict(list))
+    for row in tqdm.tqdm(dataset, desc='Processing Alpaca', disable=silent):
+        prompt, chosen, rejected = split_prompt_and_responses(row)
+        responses = [chosen, rejected]
+        n_responses = len(data[prompt]['responses'])
+        data[prompt]['pairs'].append((n_responses, n_responses + 1))
+        data[prompt]['responses'].extend(responses)
+        data[prompt]['sft_target'] = chosen
+
+    return data
+
+
+def get_stack(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str, Dict[str, Union[List[Tuple[int, int]], List[str], str]]]:
+    print(f'Loading SE stack dataset (split={split}) from huggingface...')
+    dataset = datasets.load_dataset("lvwerra/stack-exchange-paired", split=split, cache_dir=cache_dir)
+    dataset = dataset.select(range(100000))  # see https://github.com/huggingface/trl
+    print('done')
+
+    def split_prompt_and_responses(row):
+        prompt = row["question"]
+        chosen, rejected = row["response_j"], row["response_k"]
+        return prompt, chosen, rejected
+
+    data = defaultdict(lambda: defaultdict(list))
+    for row in tqdm.tqdm(dataset, desc='Processing Stack', disable=silent):
+        prompt, chosen, rejected = split_prompt_and_responses(row)
+        responses = [chosen, rejected]
+        n_responses = len(data[prompt]['responses'])
+        data[prompt]['pairs'].append((n_responses, n_responses + 1))
+        data[prompt]['responses'].extend(responses)
+        data[prompt]['sft_target'] = chosen
+
+    return data
+
+
+def load_tldr(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str, Dict[str, Union[List[Tuple[int, int]], List[str], str]]]:
+    datapath = "data/tldr/comparisons"
+
+    print(f"Loading TLDR dataset from {datapath} with '{split}' split, locally...")
+    tldr = []
+    train_re = r"batch([3-9]|10)\.json"
+
+    for f in os.listdir(datapath):
+        if not f.endswith(".json"):
+            continue
+        elif split == "train" and not re.match(train_re, f):
+            continue
+        elif split == "test" and re.match(train_re, f):
+            continue
+        f = os.path.join(datapath, f)
+
+        with open(f, "r") as fobj:
+            for jline in fobj.readlines():
+                sample = json.loads(jline)
+
+                prompt = sample["info"]["post"]
+                y1 = sample["summaries"][0]["text"]
+                y2 = sample["summaries"][1]["text"]
+
+                tldr.append({
+                    "prompt": prompt,
+                    "chosen": y1 if sample["choice"] == 0 else y2,
+                    "rejected": y2 if sample["choice"] == 0 else y1
+                })
+    print("done")
+
+    def split_prompt_and_responses(row):
+        prompt = row["prompt"]
+        chosen, rejected = row["chosen"], row["rejected"]
+        return prompt, chosen, rejected
+
+    data = defaultdict(lambda: defaultdict(list))
+    for row in tqdm.tqdm(tldr, desc='Processing TLDR', disable=silent):
+        prompt, chosen, rejected = split_prompt_and_responses(row)
+        responses = [chosen, rejected]
+        n_responses = len(data[prompt]['responses'])
+        data[prompt]['pairs'].append((n_responses, n_responses + 1))
+        data[prompt]['responses'].extend(responses)
+        data[prompt]['sft_target'] = chosen
+
+    return data
+
+
 def get_hh(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str, Dict[str, Union[List[Tuple[int, int]], List[str], str]]]:
     """Load the Anthropic Helpful-Harmless dataset from Huggingface and convert it to the necessary format.
     
@@ -168,6 +318,16 @@ def get_dataset(name: str, split: str, silent: bool = False, cache_dir: str = No
         data = get_hh(split, silent=silent, cache_dir=cache_dir)
     elif name == 'se':
         data = get_se(split, silent=silent, cache_dir=cache_dir)
+    elif name == "alpaca":
+        data = get_alpaca(split, silent=silent, cache_dir=cache_dir)
+    elif name == "rlcd":
+        data = get_rlcd(split, silent=silent, cache_dir=cache_dir)
+    elif name == "webgpt":
+        data = get_webgpt(split, silent=silent, cache_dir=cache_dir)
+    elif name == "stack":
+        data = get_stack(split, silent=silent, cache_dir=cache_dir)
+    elif name == "tldr":
+        data = load_tldr(split, silent=silent, cache_dir=cache_dir)
     else:
         raise ValueError(f"Unknown dataset '{name}'")
 
