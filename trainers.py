@@ -47,6 +47,9 @@ def dpo_loss(policy_chosen_logps: torch.FloatTensor,
              reference_chosen_logps: torch.FloatTensor,
              reference_rejected_logps: torch.FloatTensor,
              beta: float,
+             alpha: float,
+             chosen_len: int,
+             rejected_len: int,
              reference_free: bool = False) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
     """Compute the DPO loss for a batch of policy and reference model log probabilities.
     
@@ -56,6 +59,9 @@ def dpo_loss(policy_chosen_logps: torch.FloatTensor,
         reference_chosen_logps: Log probabilities of the reference model for the chosen responses. Shape: (batch_size,)
         reference_rejected_logps: Log probabilities of the reference model for the rejected responses. Shape: (batch_size,)
         beta: Temperature parameter for the DPO loss, typically something in the range of 0.1 to 0.5. We ignore the reference model as beta -> 0.
+        alpha: Length penalty parameter for loss, typically between 0.1 and 1.0
+        chosen_len: Number of tokens in the chosen sequence, ignoring padding
+        rejected_len: Number of tokens in the rejected sequence, ignoring padding
         reference_free: If True, we ignore the _provided_ reference model and implicitly use a reference model that assigns equal probability to all responses.
 
     Returns:
@@ -70,8 +76,12 @@ def dpo_loss(policy_chosen_logps: torch.FloatTensor,
         ref_logratios = 0
 
     logits = pi_logratios - ref_logratios
+    unscaled = beta * logits
 
-    losses = -F.logsigmoid(beta * logits)
+    if alpha != 0:
+        unscaled += alpha * rejected_len - alpha * chosen_len
+
+    losses = -F.logsigmoid(unscaled)
     chosen_rewards = beta * (policy_chosen_logps - reference_chosen_logps).detach()
     rejected_rewards = beta * (policy_rejected_logps - reference_rejected_logps).detach()
 
@@ -223,7 +233,13 @@ class BasicTrainer(object):
                 reference_chosen_logps, reference_rejected_logps = self.concatenated_forward(self.reference_model, batch)
 
             losses, chosen_rewards, rejected_rewards = dpo_loss(
-                policy_chosen_logps, policy_rejected_logps, reference_chosen_logps, reference_rejected_logps, beta=loss_config.beta, reference_free=loss_config.reference_free)
+                policy_chosen_logps, policy_rejected_logps, reference_chosen_logps, reference_rejected_logps,
+                beta=loss_config.beta,
+                alpha=loss_config.alpha,
+                reference_free=loss_config.reference_free,
+                chosen_len=batch["chosen_len"],
+                rejected_len=batch["rejected_len"]
+            )
             reward_accuracies = (chosen_rewards > rejected_rewards).float()
 
             chosen_rewards = all_gather_if_needed(chosen_rewards, self.rank, self.world_size)
