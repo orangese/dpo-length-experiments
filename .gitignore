@@ -3,3 +3,5 @@ __pycache__
 *.png
 env
 data
+outputs
+slurm
