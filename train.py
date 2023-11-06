@@ -18,6 +18,18 @@ import resource
 OmegaConf.register_new_resolver("get_local_run_dir", lambda exp_name, local_dirs: get_local_run_dir(exp_name, local_dirs))
 
 
+def worker_sample(rank: int, world_size: int, config: DictConfig, policy: nn.Module):
+    """Samples from model (only BasicTrainer supported)."""
+    TrainerClass = getattr(trainers, config.trainer)
+    print(f'Creating trainer on process {rank} with world size {world_size}')
+    trainer = TrainerClass(policy, config, config.seed, config.local_run_dir, reference_model=None, rank=rank, world_size=world_size)
+
+    to_save = trainer.sample(n_per=config.samples_per_prompt)
+    with open(config.sample_path, "w+") as d:
+        json.dump(to_save, d, indent=4)
+    print(f'Saved samples on {len(to_save)} eval prompts to {config.sample_path}')
+
+
 def worker_main(rank: int, world_size: int, config: DictConfig, policy: nn.Module, reference_model: Optional[nn.Module] = None):
     """Main function for each worker process (may be only 1 for BasicTrainer/TensorParallelTrainer)."""
     if 'FSDP' in config.trainer:
@@ -45,7 +57,7 @@ def worker_main(rank: int, world_size: int, config: DictConfig, policy: nn.Modul
     trainer.save()
 
 
-@hydra.main(version_base=None, config_path="config", config_name="config")
+@hydra.main(version_base=None, config_path="config-sample", config_name="config")
 def main(config: DictConfig):
     """Main entry point for training. Validates config, creates/initializes model(s), and kicks off worker process(es)."""
 
@@ -83,6 +95,11 @@ def main(config: DictConfig):
     policy = transformers.AutoModelForCausalLM.from_pretrained(
         config.model.name_or_path, cache_dir=get_local_dir(config.local_dirs), low_cpu_mem_usage=True, torch_dtype=policy_dtype, **model_kwargs)
     disable_dropout(policy)
+
+    if config.sample_only:
+        print(f'not training, just sampling (saving to {config.sample_path})')
+        worker_sample(0, 1, config, policy)
+        return
 
     if config.loss.name == 'dpo':
         print('building reference model')

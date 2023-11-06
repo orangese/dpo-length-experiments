@@ -368,6 +368,8 @@ def get_collate_fn(tokenizer) -> Callable[[List[Dict]], Dict[str, Union[List, to
                 padded_batch[k] = pad_sequence(to_pad, batch_first=True, padding_value=padding_value)
                 if 'prompt' in k:  # for the prompt, flip back so padding is on left side
                     padded_batch[k] = padded_batch[k].flip(dims=[1])
+            elif k.endswith("_len"):
+                padded_batch[k] = torch.LongTensor([ex[k] for ex in batch])
             else:
                 padded_batch[k] = [ex[k] for ex in batch]
 
