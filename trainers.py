@@ -47,6 +47,9 @@ def dpo_loss(policy_chosen_logps: torch.FloatTensor,
              reference_chosen_logps: torch.FloatTensor,
              reference_rejected_logps: torch.FloatTensor,
              beta: float,
+             alpha: float,
+             chosen_len: int,
+             rejected_len: int,
              reference_free: bool = False) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
     """Compute the DPO loss for a batch of policy and reference model log probabilities.
     
@@ -56,6 +59,9 @@ def dpo_loss(policy_chosen_logps: torch.FloatTensor,
         reference_chosen_logps: Log probabilities of the reference model for the chosen responses. Shape: (batch_size,)
         reference_rejected_logps: Log probabilities of the reference model for the rejected responses. Shape: (batch_size,)
         beta: Temperature parameter for the DPO loss, typically something in the range of 0.1 to 0.5. We ignore the reference model as beta -> 0.
+        alpha: Length penalty parameter for loss, typically between 0.1 and 1.0
+        chosen_len: Number of tokens in the chosen sequence, ignoring padding
+        rejected_len: Number of tokens in the rejected sequence, ignoring padding
         reference_free: If True, we ignore the _provided_ reference model and implicitly use a reference model that assigns equal probability to all responses.
 
     Returns:
@@ -70,8 +76,12 @@ def dpo_loss(policy_chosen_logps: torch.FloatTensor,
         ref_logratios = 0
 
     logits = pi_logratios - ref_logratios
+    unscaled = beta * logits
 
-    losses = -F.logsigmoid(beta * logits)
+    if alpha != 0:
+        unscaled += alpha * rejected_len - alpha * chosen_len
+
+    losses = -F.logsigmoid(unscaled)
     chosen_rewards = beta * (policy_chosen_logps - reference_chosen_logps).detach()
     rejected_rewards = beta * (policy_rejected_logps - reference_rejected_logps).detach()
 
@@ -134,7 +144,7 @@ def concatenated_inputs(batch: Dict[str, Union[List, torch.LongTensor]]) -> Dict
 
 
 class BasicTrainer(object):
-    def __init__(self, policy: nn.Module, config: DictConfig, seed: int, run_dir: str, reference_model: Optional[nn.Module] = None, rank: int = 0, world_size: int = 1):
+    def __init__(self, policy: nn.Module, config: DictConfig, seed: int, run_dir: str, reference_model: Optional[nn.Module] = None, rank: int = 0, world_size: int = 1, no_train: bool = False):
         """A trainer for a language model, supporting either SFT or DPO training.
            
            If multiple GPUs are present, naively splits the model across them, effectively
@@ -164,13 +174,18 @@ class BasicTrainer(object):
         self.policy = policy
         self.reference_model = reference_model
 
-        self.train_iterator = get_batch_iterator(**data_iterator_kwargs, split='train', n_epochs=config.n_epochs, n_examples=config.n_examples, batch_size=config.batch_size, silent=rank != 0, cache_dir=get_local_dir(config.local_dirs))
-        rank0_print(f'Loaded train data iterator')
+        if not no_train:
+            self.train_iterator = get_batch_iterator(**data_iterator_kwargs, split='train', n_epochs=config.n_epochs, n_examples=config.n_examples, batch_size=config.batch_size, silent=rank != 0, cache_dir=get_local_dir(config.local_dirs))
+            rank0_print(f'Loaded train data iterator')
+        else:
+            self.train_iterator = None
+            rank0_print('Did not load train data iterator')
+
         self.eval_iterator = get_batch_iterator(**data_iterator_kwargs, split='test', n_examples=config.n_eval_examples, batch_size=config.eval_batch_size, silent=rank != 0, cache_dir=get_local_dir(config.local_dirs))
         self.eval_batches = list(self.eval_iterator)
         rank0_print(f'Loaded {len(self.eval_batches)} eval batches of size {config.eval_batch_size}')
 
-    def get_batch_samples(self, batch: Dict[str, torch.LongTensor]) -> Tuple[str, str]:
+    def get_batch_samples(self, batch: Dict[str, torch.LongTensor], use_reference: bool = False) -> Tuple[str, str]:
         """Generate samples from the policy (and reference model, if doing DPO training) for the given batch of inputs."""
 
         # FSDP generation according to https://github.com/pytorch/pytorch/issues/100069
@@ -179,7 +194,7 @@ class BasicTrainer(object):
             policy_output = self.policy.generate(
                 batch['prompt_input_ids'], attention_mask=batch['prompt_attention_mask'], max_length=self.config.max_length, do_sample=True, pad_token_id=self.tokenizer.pad_token_id)
 
-        if self.config.loss.name == 'dpo':
+        if use_reference:
             ctx = lambda: (FSDP.summon_full_params(self.reference_model, writeback=False, recurse=False) if 'FSDP' in self.config.trainer else contextlib.nullcontext())
             with ctx():
                 reference_output = self.reference_model.generate(
@@ -189,7 +204,7 @@ class BasicTrainer(object):
         policy_output = all_gather_if_needed(policy_output, self.rank, self.world_size)
         policy_output_decoded = self.tokenizer.batch_decode(policy_output, skip_special_tokens=True)
 
-        if self.config.loss.name == 'dpo':
+        if use_reference:
             reference_output = pad_to_length(reference_output, self.config.max_length, self.tokenizer.pad_token_id)
             reference_output = all_gather_if_needed(reference_output, self.rank, self.world_size)
             reference_output_decoded = self.tokenizer.batch_decode(reference_output, skip_special_tokens=True)
@@ -223,7 +238,13 @@ class BasicTrainer(object):
                 reference_chosen_logps, reference_rejected_logps = self.concatenated_forward(self.reference_model, batch)
 
             losses, chosen_rewards, rejected_rewards = dpo_loss(
-                policy_chosen_logps, policy_rejected_logps, reference_chosen_logps, reference_rejected_logps, beta=loss_config.beta, reference_free=loss_config.reference_free)
+                policy_chosen_logps, policy_rejected_logps, reference_chosen_logps, reference_rejected_logps,
+                beta=loss_config.beta,
+                alpha=loss_config.alpha,
+                reference_free=loss_config.reference_free,
+                chosen_len=batch["chosen_len"],
+                rejected_len=batch["rejected_len"]
+            )
             reward_accuracies = (chosen_rewards > rejected_rewards).float()
 
             chosen_rewards = all_gather_if_needed(chosen_rewards, self.rank, self.world_size)
@@ -252,6 +273,35 @@ class BasicTrainer(object):
 
         return losses.mean(), metrics
 
+    def sample(self, n_per=10):
+        """Samples from self.policy over the evaluation set. Bootstraps n_per samples per prompt."""
+        torch.manual_seed(self.seed)
+        np.random.seed(self.seed)
+        random.seed(self.seed)
+
+        if self.config.n_eval_model_samples < self.config.eval_batch_size:
+            rank0_print(f'Warning: n_eval_model_samples ({self.config.n_eval_model_samples}) < eval_batch_size ({self.config.eval_batch_size}). Sampling from the first complete eval batch of prompts.')
+            sample_batches = self.eval_batches[:1]
+        else:
+            n_sample_batches = self.config.n_eval_model_samples // self.config.eval_batch_size
+            sample_batches = self.eval_batches[:n_sample_batches]
+
+        result = {}
+        self.policy.eval()
+
+        for eval_batch in (tqdm.tqdm(sample_batches, desc='Generating samples...') if self.rank == 0 else sample_batches):
+            local_eval_batch = slice_and_move_batch_for_device(eval_batch, self.rank, self.world_size, self.rank)
+            for i in range(n_per):
+                samples, _ = self.get_batch_samples(local_eval_batch, use_reference=False)
+
+                for prompt, sample in zip(eval_batch['prompt'], samples):
+                    try:
+                        result[prompt].append(sample)
+                    except KeyError:
+                        result[prompt] = [sample]
+
+        return result
+
     def train(self):
         """Begin either SFT or DPO training, with periodic evaluation."""
 
@@ -262,13 +312,16 @@ class BasicTrainer(object):
         torch.manual_seed(self.seed)
         np.random.seed(self.seed)
         random.seed(self.seed)
-
+        
         if self.config.loss.name == 'dpo':
             self.reference_model.eval()
 
         self.example_counter = 0
         self.batch_counter = 0
         last_log = None
+
+        if self.train_iterator is None:
+            raise ValueError("No train iterator loaded, cannot train")
 
         for batch in self.train_iterator:
             #### BEGIN EVALUATION ####
@@ -300,7 +353,10 @@ class BasicTrainer(object):
                         sample_batches = self.eval_batches[:n_sample_batches]
                     for eval_batch in (tqdm.tqdm(sample_batches, desc='Generating samples...') if self.rank == 0 else sample_batches):
                         local_eval_batch = slice_and_move_batch_for_device(eval_batch, self.rank, self.world_size, self.rank)
-                        policy_samples, reference_samples = self.get_batch_samples(local_eval_batch)
+                        policy_samples, reference_samples = self.get_batch_samples(
+                            local_eval_batch,
+                            use_reference=self.config.loss.name == 'dpo'
+                        )
 
                         all_policy_samples.extend(policy_samples)
                         all_reference_samples.extend(reference_samples)

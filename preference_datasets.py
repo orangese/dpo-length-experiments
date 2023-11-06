@@ -147,9 +147,13 @@ def get_webgpt(split: str, silent: bool = False, cache_dir: str = None) -> Dict[
 
 
 def get_rlcd(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str, Dict[str, Union[List[Tuple[int, int]], List[str], str]]]:
+    if split == "test":
+        split = "validation"
+        # only "train", "validation" available
+
     print(f'Loading RLCD dataset ({split}) from Huggingface...')
     dataset = datasets.load_dataset("TaylorAI/RLCD-generated-preference-data-split", split=split, cache_dir=cache_dir)
-    print('done')
+    print('done', len(dataset))
 
     def split_prompt_and_responses(row):
         prompt = (row["instruction"] or "") + (row["input"] or "")
@@ -364,6 +368,8 @@ def get_collate_fn(tokenizer) -> Callable[[List[Dict]], Dict[str, Union[List, to
                 padded_batch[k] = pad_sequence(to_pad, batch_first=True, padding_value=padding_value)
                 if 'prompt' in k:  # for the prompt, flip back so padding is on left side
                     padded_batch[k] = padded_batch[k].flip(dims=[1])
+            elif k.endswith("_len"):
+                padded_batch[k] = torch.LongTensor([ex[k] for ex in batch])
             else:
                 padded_batch[k] = [ex[k] for ex in batch]
 
@@ -427,6 +433,8 @@ def tokenize_batch_element(prompt: str, chosen: str, rejected: str, truncation_m
     batch['rejected'] = prompt + rejected
     batch['chosen_response_only'] = chosen
     batch['rejected_response_only'] = rejected
+    batch['chosen_len'] = len(chosen_tokens['input_ids'])
+    batch['rejected_len'] = len(rejected_tokens['input_ids'])
 
     for k, toks in {'chosen': chosen_sequence_tokens, 'rejected': rejected_sequence_tokens, 'prompt': prompt_tokens}.items():
         for type_key, tokens in toks.items():
