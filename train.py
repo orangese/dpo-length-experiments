@@ -57,7 +57,7 @@ def worker_main(rank: int, world_size: int, config: DictConfig, policy: nn.Modul
     trainer.save()
 
 
-@hydra.main(version_base=None, config_path="config-sample", config_name="config")
+@hydra.main(version_base=None, config_path="config", config_name="config")
 def main(config: DictConfig):
     """Main entry point for training. Validates config, creates/initializes model(s), and kicks off worker process(es)."""
 
@@ -96,12 +96,7 @@ def main(config: DictConfig):
         config.model.name_or_path, cache_dir=get_local_dir(config.local_dirs), low_cpu_mem_usage=True, torch_dtype=policy_dtype, **model_kwargs)
     disable_dropout(policy)
 
-    if config.sample_only:
-        print(f'not training, just sampling (saving to {config.sample_path})')
-        worker_sample(0, 1, config, policy)
-        return
-
-    if config.loss.name == 'dpo':
+    if config.loss.name == 'dpo' and not config.sample_only:
         print('building reference model')
         reference_model_dtype = getattr(torch, config.model.reference_dtype)
         reference_model = transformers.AutoModelForCausalLM.from_pretrained(
@@ -115,9 +110,14 @@ def main(config: DictConfig):
         step, metrics = state_dict['step_idx'], state_dict['metrics']
         print(f'loading pre-trained weights at step {step} from {config.model.archive} with metrics {json.dumps(metrics, indent=2)}')
         policy.load_state_dict(state_dict['state'])
-        if config.loss.name == 'dpo':
+        if config.loss.name == 'dpo' and not config.sample_only:
             reference_model.load_state_dict(state_dict['state'])
         print('loaded pre-trained weights')
+
+    if config.sample_only:
+        print(f'not training, just sampling (saving to {config.sample_path})')
+        worker_sample(0, 1, config, policy)
+        return
     
     if 'FSDP' in config.trainer:
         world_size = torch.cuda.device_count()

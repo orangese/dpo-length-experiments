@@ -48,8 +48,8 @@ def dpo_loss(policy_chosen_logps: torch.FloatTensor,
              reference_rejected_logps: torch.FloatTensor,
              beta: float,
              alpha: float,
-             chosen_len: int,
-             rejected_len: int,
+             chosen_len: torch.FloatTensor,
+             rejected_len: torch.FloatTensor,
              reference_free: bool = False) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
     """Compute the DPO loss for a batch of policy and reference model log probabilities.
     
