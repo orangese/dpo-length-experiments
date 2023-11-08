@@ -3,12 +3,21 @@ import os
 import pickle
 import seaborn as sns
 import matplotlib.pyplot as plt
-from preference_datasets import get_dataset
 from tqdm import tqdm
 import transformers
 
+import sys
+sys.path.insert(1, "../")
+from preference_datasets import get_dataset
 
-def get_len(text, cache, tokenizer):
+tokenizer = transformers.AutoTokenizer.from_pretrained(
+    "EleutherAI/pythia-2.8b"
+)
+
+
+def get_len(text, tokenizer=tokenizer, cache=None):
+    if cache is None:
+        cache = {}
     try:
         toklen = cache[text]
     except KeyError:
@@ -17,7 +26,7 @@ def get_len(text, cache, tokenizer):
     return toklen
 
 
-def plot_length(dataset, code, name, maxlen, tokenizer):
+def plot_length(dataset, code, name, maxlen):
     # Get token lengths
     results = []
     cfile = f"cache/{name}_lens.pkl"
@@ -34,12 +43,12 @@ def plot_length(dataset, code, name, maxlen, tokenizer):
             chosen = completions["responses"][pair[0]]
             rejected = completions["responses"][pair[1]]
             info = {
-                f"Preferred length": min(get_len(chosen, cache, tokenizer), maxlen),
-                f"Dispreferred length": min(get_len(rejected, cache, tokenizer), maxlen),
+                f"Preferred length": min(get_len(chosen, cache=cache), maxlen),
+                f"Dispreferred length": min(get_len(rejected, cache=cache), maxlen),
             }
             info["Length difference"] = info["Preferred length"] - info["Dispreferred length"]
             results.append(info)
-    
+
     with open(cfile, "wb") as f:
         print(f"caching {cfile} for later...")
         pickle.dump(cache, f)
@@ -86,12 +95,12 @@ def plot_length(dataset, code, name, maxlen, tokenizer):
 
     plt.axvline(
         results["Preferred length"].mean(),
-        color=b, linestyle='--', 
+        color=b, linestyle='--',
         label=f'Mean preferred'
     )
     plt.axvline(
-        results["Dispreferred length"].mean(), 
-        color=r, linestyle='--', 
+        results["Dispreferred length"].mean(),
+        color=r, linestyle='--',
         label=f'Mean dispreferred'
     )
     plt.savefig(f"figs/{code}", dpi=500, bbox_inches="tight")
@@ -106,14 +115,14 @@ def plot_length(dataset, code, name, maxlen, tokenizer):
     plt.xlabel("Difference in sequence length in tokens")
     plt.ylabel(f"Density (n={len(dataset)})")
     plt.axvline(
-        results["Length difference"].mean(), 
-        color=b, linestyle='--', 
+        results["Length difference"].mean(),
+        color=b, linestyle='--',
     )
     plt.legend(
         [f'Mean length difference'],
         prop={"size": 15},
         loc='upper left'
-    ) 
+    )
 
     plt.title(name)
     plt.gca().axes.get_yaxis().set_ticks([])
@@ -131,7 +140,7 @@ def plot_accs(accs):
     for name, arr in accs.items():
         names.append(name)
         acc.append(sum(arr) / len(arr))
-    
+
     df = pd.DataFrame({"Dataset": names, "Accuracy": acc})
     sns.barplot(x="Dataset", y="Accuracy", data=df)
     plt.xticks(rotation=45)
@@ -157,29 +166,25 @@ if __name__ == "__main__":
         # TODO: https://huggingface.co/datasets/openbmb/UltraFeedback/viewer/default/train?row=4
         "alpaca": ("AlpacaFarm", 500),
     }
-    
+
     if not os.path.exists("figs"):
         os.makedirs("figs")
-    
+
     plt.rcParams.update({"font.size": 15})
-    tokenizer = transformers.AutoTokenizer.from_pretrained(
-        "huggyllama/llama-7b"
-    )
-    
     table_texts = []
     accs = {}
 
     for ds_code in info:
         ds = get_dataset(ds_code, split)
         name, maxlen = info[ds_code]
-        table, acc = plot_length(ds, ds_code, name, maxlen, tokenizer)
+        table, acc = plot_length(ds, ds_code, name, maxlen)
         table_texts.append(table)
         accs[ds_code] = acc
 
     print("\n" + "=" * 80 + "\n")
     print("Table 1: Length statistics")
     print("\n".join(table_texts) + "\n")
-    
+
     print("Classification accuracy based on length alone")
     print({k: round(sum(v) / len(v), 3) for k, v in accs.items()})
 
