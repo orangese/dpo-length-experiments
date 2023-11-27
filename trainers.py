@@ -79,7 +79,7 @@ def dpo_loss(policy_chosen_logps: torch.FloatTensor,
     unscaled = beta * logits
 
     if alpha != 0:
-        unscaled += alpha * rejected_len - alpha * chosen_len
+        unscaled -= alpha * rejected_len - alpha * chosen_len
 
     losses = -F.logsigmoid(unscaled)
     chosen_rewards = beta * (policy_chosen_logps - reference_chosen_logps).detach()
