@@ -14,4 +14,4 @@
 
 source env/bin/activate
 ulimit -n 64000
-python -u train.py model=pythia28 batch_size=64 eval_batch_size=64 trainer=FSDPTrainer model.archive=/iris/u/rafailov/DPOExperiments/models/rafailov/pythia2.8b_sft_hh/LATEST/policy.pt model.fsdp_policy_mp=bfloat16 gradient_accumulation_steps=16 loss=dpo loss.beta=0.1 loss.alpha=0.01 datasets=[hh] exp_name=pythia28-hh-length-small-64batch
+python -u train.py model=pythia28 batch_size=64 eval_batch_size=4 trainer=FSDPTrainer model.archive=/iris/u/rafailov/DPOExperiments/models/rafailov/pythia2.8b_sft_hh/LATEST/policy.pt model.fsdp_policy_mp=bfloat16 gradient_accumulation_steps=16 loss=dpo loss.beta=0.1 loss.alpha=0.005 datasets=[hh] exp_name=pythia28-hh-length-small-64batch-flipped
