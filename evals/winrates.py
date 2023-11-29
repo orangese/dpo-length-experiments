@@ -1,28 +1,26 @@
-import pickle
+import logging
 import json
+import random
 import os
 import argparse
-import random
 import numpy as np
+import pandas as pd
 from tqdm import tqdm
-from openai import OpenAI
 from datasets import load_dataset
 from collections import defaultdict
-from functools import partial
-
-client = OpenAI()#timeout=10)
+import seaborn as sns
+import matplotlib.pyplot as plt
+from throttler import submit_jobs
 
 
 def load_prompt(pfile, pdir):
+    """
+    Loads prompt from file.
+    """
     with open(os.path.join(pdir, pfile)) as t:
         prompt = "\n".join(map(str.strip, t.readlines()))
-    
-    print(f"loaded {pfile}")
-    print("=" * 80)
-    print(prompt)
-    print("=" * 80)
-    print()
 
+    print(f"loaded {pfile}")
     return prompt
 
 
@@ -50,7 +48,7 @@ def load_samples(sample_dir, to_process=None):
     """
     if to_process is None:
         to_process = os.listdir(sample_dir)
-    
+
     sampled = defaultdict(dict)
     kword = "Assistant:"
     for f in to_process:
@@ -61,76 +59,147 @@ def load_samples(sample_dir, to_process=None):
                     v = v[0]
                     response = v[v.rfind(kword) + len(kword) + 1:]
                     sampled[f.replace(".json", "")][prompt] = response
-   
+
     print(f"loaded samples from {len(to_process)} models")
     return sampled
 
 
-def cache_key(a, b, query, prompt, model):
+def batch_judge(batch, system, template, key, model_wins, cache_file, gpt_model, seed=None):
     """
-    Formulates cache request for GPT critic.
+    Batch critic judge given quality/brevity template and batch of completions.
+    template and key control the quality/brevity prompt to use.
     """
-    return f"{a}::{b}::{query}::{prompt}::{model}"
+    requests = [
+        dict(
+            messages=[
+                dict(role="system", content=system),
+                dict(role="user", content=(a, b, prompt, template, model))
+            ],
+            model=gpt_model,
+            seed=seed,
+        )
+        for a, b, prompt, model in batch
+    ]
+    responses = submit_jobs(requests, cache_file=cache_file)
+    for (*_, model), judgement in responses.items():
+        model_wins[model][key].append(judgement)
 
 
-def judge(a, b, query, prompt, system, model="gpt-4-0613", seed=None, cache_file=None):
+def winrates(
+    truth,
+    sampled,
+    quality,
+    brevity,
+    system,
+    gpt_model,
+    cache_file,
+    batch_size,
+    seed
+):
     """
-    Judges responses a and b based on quality or brevity prompt
-    from GPT critic. Randomly flips a and b as well.
+    Gets winrates between truth and sampled given critic prompts.
     """
-    key = cache_key(a, b, query, prompt, model)
-    try:
-        with open(cache_file, "rb") as c:
-            cache = pickle.load(c)
-    except (EOFError, FileNotFoundError):
-        with open(cache_file, "wb+") as d:
-            pass
-        cache = {}
-
-    try:
-        return cache[key]
-    except KeyError:
-        pass
-
-    flipped = False
-    if random.random() < 0.5:
-        a, b = b, a
-        flipped = True
+    def do_batch(batch, pbar, model_wins, cache_file, seed):
+        batch_judge(batch, system, quality, "quality", model_wins, cache_file, gpt_model, seed)
+        pbar.update(batch_size // 2)
     
-    prompt = prompt.replace("{{QUERY}}", query.replace("\n", "\\n"))
-    prompt = prompt.replace("{{A}}", a.replace("\n", "\\n"))
-    prompt = prompt.replace("{{B}}", b.replace("\n", "\\n"))
+        batch_judge(batch, system, brevity, "brevity", model_wins, cache_file, gpt_model, seed)
+        pbar.update(batch_size // 2)
 
-    ans = None
-    while True:
+    model_wins = {}
+    pbar = tqdm(total=len(truth) * len(sampled))
+    batch = []
+    i = 0
+
+    for prompt in truth:
+        # Get batch so far
         try:
-            compl = client.chat.completions.create(
-                messages=[
-                    dict(role="system", content=system),
-                    dict(role="user", content=prompt)
-                ],
-                model=model,
-                seed=seed
-            )
-            ans = compl.choices[0].message.content
-        except:
-            continue
-        if ans[-1] in ("A", "B"):
-            break
+            for model in sampled:
+                if model not in model_wins:
+                    model_wins[model] = defaultdict(list)
+                a, b = sampled[model][prompt], truth[prompt]
+                batch.append((a, b, prompt, model))
+        except KeyError:
+            pass
 
-    judgement = ans[-1] == "A" if not flipped else ans[-1] == "B"
-    cache[key] = judgement
-    with open(cache_file, "wb+") as d:
-        pickle.dump(cache, d)
+        # Execute batch
+        if len(batch) >= batch_size:
+            do_batch(batch, pbar, model_wins, cache_file, seed)
+            batch = []
+            i += batch_size
+            if i > 200:
+                break
+    
+    if len(batch) > 0:
+        do_batch(batch, pbar, model_wins, cache_file, seed)
+    
+    return model_wins
 
-    return judgement
+
+def analyze(model_wins):
+    """
+    Analyzes winrates.
+    """
+    for model in model_wins:
+        print("model:", model)
+        for key, scores in model_wins[model].items():
+            print("-" * 20)
+            print("metric:", key)
+            print("len:   ", len(scores))
+            print("mean:  ", np.mean(scores))
+            print("std:   ", np.std(scores))
+        print("=" * 60)
+
+    flat = []
+    for model in model_wins:
+        for key, scores in model_wins[model].items():
+            for score in scores:
+                flat.append(dict(model=model, metric=key, win=int(score)))
+    flat = pd.DataFrame(flat)
+    
+    print(flat)
+    sns.barplot(flat, x="model", y="win", errorbar="ci", hue="metric")
+    plt.title("GPT4 winrates for quality (helpfulness) and brevity")
+    plt.show()
+
+   # Compute mean, std, and count for each model and metric
+    model_stats = flat.groupby(['model', 'metric']).agg(['mean', 'std', 'count']).reset_index()
+    model_stats.columns = ['model', 'metric', 'mean', 'std', 'count']
+
+    # Function to calculate 90% CI
+    def ci_90(std, count):
+        return 1.645 * (std / np.sqrt(count))
+
+    # Applying the CI function
+    model_stats['ci_90'] = model_stats.apply(lambda row: ci_90(row['std'], row['count']), axis=1)
+
+    # Separate stats for quality and brevity
+    quality_stats = model_stats[model_stats['metric'] == 'quality']
+    brevity_stats = model_stats[model_stats['metric'] == 'brevity']
+
+    # Merge the two stats dataframes on model
+    merged_stats = pd.merge(quality_stats, brevity_stats, on='model', suffixes=('_quality', '_brevity'))
+
+    # Plotting
+    plt.figure(figsize=(10, 6))
+    for _, row in merged_stats.iterrows():
+        plt.errorbar(x=row['mean_brevity'], y=row['mean_quality'], 
+                    xerr=row['ci_90_brevity'], yerr=row['ci_90_quality'], 
+                    fmt='o', capsize=5, label=row['model'])
+
+    plt.xlabel('Mean Brevity Score')
+    plt.ylabel('Mean Quality Score')
+    plt.title('GPT4 winrates for quality (helpfulness) vs brevity (90% CI)')
+    plt.legend(bbox_to_anchor=(0.6, 1), loc='upper left')
+    plt.grid(True)
+    plt.show()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--model",
-        default="gpt-4-0613",
+        default="gpt-4",
         help="gpt critic model to use"
     )
     parser.add_argument(
@@ -158,7 +227,19 @@ if __name__ == "__main__":
         default=".gptcache",
         help="cache file for gpt responses"
     )
+    parser.add_argument(
+        "--batch_size",
+        default=60,
+        help="batch size for parallel calls"
+    )
+    parser.add_argument(
+        "--log_level",
+        default="WARNING",
+        help="logging level"
+    )
     args = parser.parse_args()
+    random.seed(args.seed)
+    logging.basicConfig(level=args.log_level)
 
     quality = load_prompt("quality.prompt", args.prompt_dir)
     brevity = load_prompt("brevity.prompt", args.prompt_dir)
@@ -166,35 +247,15 @@ if __name__ == "__main__":
 
     sampled = load_samples(args.sample_dir, args.sample_files)
     truth = load_hh()
-
-    model_wins = {}
-    judger = partial(
-        judge,
-        system=system,
-        model=args.model,
-        seed=args.seed,
-        cache_file=args.cache
+    model_wins = winrates(
+        truth,
+        sampled,
+        quality,
+        brevity,
+        system,
+        args.model,
+        args.cache,
+        args.batch_size,
+        args.seed
     )
-
-    for prompt in tqdm(truth):
-        try:
-            for model in sampled:
-                if model not in model_wins:
-                    model_wins[model] = defaultdict(list)
-                a, b = sampled[model][prompt], truth[prompt]
-                model_wins[model]["quality"].append(judger(a, b, prompt, quality))
-                model_wins[model]["brevity"].append(judger(a, b, prompt, brevity))
-
-        except KeyError:
-            pass
-
-    for model in model_wins:
-        print("model:", model)
-        for key, scores in model_wins[model].items():
-            print("-" * 20)
-            print("metric:", key)
-            print("len:   ", len(scores))
-            print("mean:  ", np.mean(scores))
-            print("std:   ", np.std(scores))
-        print("=" * 60)
-
+    analyze(model_wins)
