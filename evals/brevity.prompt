@@ -1,0 +1,16 @@
+For the following query to a chatbot, which response is more concise?
+
+Query: {{QUERY}}
+
+Response A:
+{{A}}
+
+Response B:
+{{B}}
+
+FIRST provide a one-sentence comparison of the two responses and explain \
+which you feel is more concise. SECOND, on a new line, state only "A" or \
+"B" to indicate which response is more concise. Your response should use \
+the format:
+Comparison: <one-sentence comparison and explanation>
+More concise: <"A" or "B">

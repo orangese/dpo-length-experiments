@@ -1,0 +1,1 @@
+You are an evaluation system that compares the quality of the summaries of two automated summarization systems. Given a forum post and two generated summaries, you have to decide which more effectively summarizes the main points of the post.
