@@ -91,6 +91,8 @@ The script is structured as follows:
     - Run main()
 """
 
+from __future__ import annotations
+
 # imports
 import random
 import aiohttp  # for making API calls concurrently

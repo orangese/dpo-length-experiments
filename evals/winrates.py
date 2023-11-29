@@ -94,7 +94,8 @@ def winrates(
     gpt_model,
     cache_file,
     batch_size,
-    seed
+    seed,
+    stop
 ):
     """
     Gets winrates between truth and sampled given critic prompts.
@@ -127,8 +128,10 @@ def winrates(
             do_batch(batch, pbar, model_wins, cache_file, seed)
             batch = []
             i += batch_size
+            if stop is not None and i > stop:
+                break
     
-    if len(batch) > 0:
+    if len(batch) > 0 and stop is not None and i <= stop:
         do_batch(batch, pbar, model_wins, cache_file, seed)
     
     return model_wins
@@ -159,6 +162,7 @@ def analyze(model_wins):
     sns.barplot(flat, x="model", y="win", errorbar="ci", hue="metric")
     plt.title("GPT4 winrates for quality (helpfulness) and brevity")
     plt.show()
+    plt.savefig("barplot.png", dpi=200)
 
    # Compute mean, std, and count for each model and metric
     model_stats = flat.groupby(['model', 'metric']).agg(['mean', 'std', 'count']).reset_index()
@@ -191,6 +195,7 @@ def analyze(model_wins):
     plt.legend(bbox_to_anchor=(0.6, 1), loc='upper left')
     plt.grid(True)
     plt.show()
+    plt.savefig("scatterplot.png", dpi=200)
 
 
 if __name__ == "__main__":
@@ -235,6 +240,12 @@ if __name__ == "__main__":
         default="WARNING",
         help="logging level"
     )
+    parser.add_argument(
+        "--stop",
+        default=None,
+        type=int,
+        help="stop at example i"
+    )
     args = parser.parse_args()
     random.seed(args.seed)
     logging.basicConfig(level=args.log_level)
@@ -254,6 +265,7 @@ if __name__ == "__main__":
         args.model,
         args.cache,
         args.batch_size,
-        args.seed
+        args.seed,
+        args.stop
     )
     analyze(model_wins)
