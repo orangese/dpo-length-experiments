@@ -127,8 +127,6 @@ def winrates(
             do_batch(batch, pbar, model_wins, cache_file, seed)
             batch = []
             i += batch_size
-            if i > 200:
-                break
     
     if len(batch) > 0:
         do_batch(batch, pbar, model_wins, cache_file, seed)
