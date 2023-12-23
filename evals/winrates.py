@@ -161,8 +161,8 @@ def analyze(model_wins):
     print(flat)
     sns.barplot(flat, x="model", y="win", errorbar="ci", hue="metric")
     plt.title("GPT4 winrates for quality (helpfulness) and brevity")
-    plt.show()
-    plt.savefig("barplot.png", dpi=200)
+    plt.tight_layout()
+    plt.savefig("winrates_bar.png", dpi=200, bbox_inches='tight')
 
    # Compute mean, std, and count for each model and metric
     model_stats = flat.groupby(['model', 'metric']).agg(['mean', 'std', 'count']).reset_index()
@@ -192,10 +192,9 @@ def analyze(model_wins):
     plt.xlabel('Mean Brevity Score')
     plt.ylabel('Mean Quality Score')
     plt.title('GPT4 winrates for quality (helpfulness) vs brevity (90% CI)')
-    plt.legend(bbox_to_anchor=(0.6, 1), loc='upper left')
+    plt.legend(bbox_to_anchor=(0, 0.2), loc='upper left')
     plt.grid(True)
-    plt.show()
-    plt.savefig("scatterplot.png", dpi=200)
+    plt.savefig("winrates_scatter.png", dpi=200, bbox_inches='tight')
 
 
 if __name__ == "__main__":
