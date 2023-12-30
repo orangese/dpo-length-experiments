@@ -14,14 +14,21 @@ from throttler import submit_jobs
 
 
 def load_prompt(pfile, pdir):
-    """
-    Loads prompt from file.
-    """
+    """ Loads prompt from file.  """
     with open(os.path.join(pdir, pfile)) as t:
         prompt = "\n".join(map(str.strip, t.readlines()))
 
     print(f"loaded {pfile}")
     return prompt
+
+
+def shuffle(d):
+    """
+    Shuffle dataset.
+    """
+    k = list(d.keys())
+    random.shuffle(k)
+    return {key: d[key] for key in k}
 
 
 def load_hh():
@@ -37,6 +44,22 @@ def load_hh():
         reformatted[entry["chosen"][:s]] = entry["chosen"][s + 1:]
         i += 1
     print(f"loaded {i} examples from HH test split")
+    return reformatted
+
+
+def load_shp():
+    """
+    Loads SHP dataset test split.
+    """
+    dataset = load_dataset("stanfordnlp/SHP", split="test")
+    reformatted = {}
+    i = 0
+    for entry in tqdm(dataset):
+        key = "A" if int(entry["labels"]) == 0 else "B"
+        prompt = f"\n\nHuman: {entry['history']}\n\nAssistant:"
+        reformatted[prompt] = entry[f"human_ref_{key}"]
+        i += 1
+    print(f"loaded {i} examples from SHP test split")
     return reformatted
 
 
@@ -64,7 +87,7 @@ def load_samples(sample_dir, to_process=None):
     return sampled
 
 
-def batch_judge(batch, system, template, key, model_wins, cache_file, gpt_model, seed=None):
+def batch_judge(batch, system, template, key, model_wins, cache_file, gpt_model, seed=None, use_lab_key=False):
     """
     Batch critic judge given quality/brevity template and batch of completions.
     template and key control the quality/brevity prompt to use.
@@ -80,7 +103,13 @@ def batch_judge(batch, system, template, key, model_wins, cache_file, gpt_model,
         )
         for a, b, prompt, model in batch
     ]
-    responses = submit_jobs(requests, cache_file=cache_file)
+
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if use_lab_key:
+        api_key = os.getenv("LAB_OPENAI_API_KEY", api_key)
+
+    responses = submit_jobs(requests, cache_file=cache_file, api_key=api_key)
     for (*_, model), judgement in responses.items():
         model_wins[model][key].append(judgement)
 
@@ -95,16 +124,17 @@ def winrates(
     cache_file,
     batch_size,
     seed,
-    stop
+    stop,
+    use_lab_key
 ):
     """
     Gets winrates between truth and sampled given critic prompts.
     """
     def do_batch(batch, pbar, model_wins, cache_file, seed):
-        batch_judge(batch, system, quality, "quality", model_wins, cache_file, gpt_model, seed)
+        batch_judge(batch, system, quality, "quality", model_wins, cache_file, gpt_model, seed, use_lab_key)
         pbar.update(batch_size // 2)
-    
-        batch_judge(batch, system, brevity, "brevity", model_wins, cache_file, gpt_model, seed)
+
+        batch_judge(batch, system, brevity, "brevity", model_wins, cache_file, gpt_model, seed, use_lab_key)
         pbar.update(batch_size // 2)
 
     model_wins = {}
@@ -128,12 +158,12 @@ def winrates(
             do_batch(batch, pbar, model_wins, cache_file, seed)
             batch = []
             i += batch_size
-            if stop is not None and i > stop:
+            if stop is not None and i > stop * len(sampled):
                 break
-    
-    if len(batch) > 0 and stop is not None and i <= stop:
+
+    if len(batch) > 0 and stop is not None and i <= stop * len(sampled):
         do_batch(batch, pbar, model_wins, cache_file, seed)
-    
+
     return model_wins
 
 
@@ -157,7 +187,7 @@ def analyze(model_wins):
             for score in scores:
                 flat.append(dict(model=model, metric=key, win=int(score)))
     flat = pd.DataFrame(flat)
-    
+
     print(flat)
     sns.barplot(flat, x="model", y="win", errorbar="ci", hue="metric")
     plt.title("GPT4 winrates for quality (helpfulness) and brevity")
@@ -185,8 +215,8 @@ def analyze(model_wins):
     # Plotting
     plt.figure(figsize=(10, 6))
     for _, row in merged_stats.iterrows():
-        plt.errorbar(x=row['mean_brevity'], y=row['mean_quality'], 
-                    xerr=row['ci_90_brevity'], yerr=row['ci_90_quality'], 
+        plt.errorbar(x=row['mean_brevity'], y=row['mean_quality'],
+                    xerr=row['ci_90_brevity'], yerr=row['ci_90_quality'],
                     fmt='o', capsize=5, label=row['model'])
 
     plt.xlabel('Mean Brevity Score')
@@ -203,6 +233,11 @@ if __name__ == "__main__":
         "--model",
         default="gpt-4",
         help="gpt critic model to use"
+    )
+    parser.add_argument(
+        "--dataset",
+        default="hh",
+        help="dataset to use (hh default)"
     )
     parser.add_argument(
         "--sample_dir",
@@ -245,6 +280,12 @@ if __name__ == "__main__":
         type=int,
         help="stop at example i"
     )
+    parser.add_argument(
+        "--lab_key",
+        action="store_true",
+        help="use LAB_OPENAI_API_KEY instead of OPENAI_API_KEY"
+    )
+
     args = parser.parse_args()
     random.seed(args.seed)
     logging.basicConfig(level=args.log_level)
@@ -254,17 +295,21 @@ if __name__ == "__main__":
     system = load_prompt("system.prompt", args.prompt_dir)
 
     sampled = load_samples(args.sample_dir, args.sample_files)
-    truth = load_hh()
-    model_wins = winrates(
-        truth,
-        sampled,
-        quality,
-        brevity,
-        system,
-        args.model,
-        args.cache,
-        args.batch_size,
-        args.seed,
-        args.stop
+    truth = locals()[f"load_{args.dataset}"]()
+    truth = shuffle(truth)
+
+    analyze(
+        winrates(
+            truth,
+            sampled,
+            quality,
+            brevity,
+            system,
+            args.model,
+            args.cache,
+            args.batch_size,
+            args.seed,
+            args.stop,
+            args.lab_key
+        )
     )
-    analyze(model_wins)
