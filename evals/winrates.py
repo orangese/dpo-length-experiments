@@ -138,7 +138,8 @@ def winrates(
         pbar.update(batch_size // 2)
 
     model_wins = {}
-    pbar = tqdm(total=len(truth) * len(sampled))
+    stop *= len(sampled)
+    pbar = tqdm(total=min(len(truth) * len(sampled), stop))
     batch = []
     i = 0
 
@@ -158,10 +159,10 @@ def winrates(
             do_batch(batch, pbar, model_wins, cache_file, seed)
             batch = []
             i += batch_size
-            if stop is not None and i > stop * len(sampled):
+            if stop is not None and i > stop:
                 break
 
-    if len(batch) > 0 and stop is not None and i <= stop * len(sampled):
+    if len(batch) > 0 and stop is not None and i <= stop:
         do_batch(batch, pbar, model_wins, cache_file, seed)
 
     return model_wins
@@ -171,6 +172,16 @@ def analyze(model_wins):
     """
     Analyzes winrates.
     """
+    prefix = ""
+    stop = False
+    for char in list(model_wins.keys())[0]:
+        for model in model_wins:
+            if not model.startswith(prefix + char):
+                stop = True
+        if stop:
+            break
+        prefix += char
+
     for model in model_wins:
         print("model:", model)
         for key, scores in model_wins[model].items():
@@ -185,46 +196,51 @@ def analyze(model_wins):
     for model in model_wins:
         for key, scores in model_wins[model].items():
             for score in scores:
+                model = model.replace(prefix, "").strip("_full")
                 flat.append(dict(model=model, metric=key, win=int(score)))
     flat = pd.DataFrame(flat)
+    arch, ds, *_ = prefix.split("_")
 
-    print(flat)
+    # Bar plot for win rates
     sns.barplot(flat, x="model", y="win", errorbar="ci", hue="metric")
-    plt.title("GPT4 winrates for quality (helpfulness) and brevity")
+    plt.title(f"{ds.upper()}: GPT4 winrates for quality (helpfulness) and brevity")
+    plt.xlabel("Model ID")
+    plt.ylabel("GPT Win Rate")
     plt.tight_layout()
-    plt.savefig("winrates_bar.png", dpi=200, bbox_inches='tight')
+    plt.savefig(f"{ds.lower()}_bar.png", dpi=200, bbox_inches='tight')
 
    # Compute mean, std, and count for each model and metric
     model_stats = flat.groupby(['model', 'metric']).agg(['mean', 'std', 'count']).reset_index()
     model_stats.columns = ['model', 'metric', 'mean', 'std', 'count']
-
-    # Function to calculate 90% CI
-    def ci_90(std, count):
-        return 1.645 * (std / np.sqrt(count))
-
-    # Applying the CI function
-    model_stats['ci_90'] = model_stats.apply(lambda row: ci_90(row['std'], row['count']), axis=1)
+    model_stats['ci_90'] = model_stats.apply(
+        lambda row: 1.645 * (row['std'] / np.sqrt(row['count'])),
+        axis=1
+    )
 
     # Separate stats for quality and brevity
     quality_stats = model_stats[model_stats['metric'] == 'quality']
     brevity_stats = model_stats[model_stats['metric'] == 'brevity']
 
-    # Merge the two stats dataframes on model
+    # Merge the two stats dataframes on model and plot
     merged_stats = pd.merge(quality_stats, brevity_stats, on='model', suffixes=('_quality', '_brevity'))
-
-    # Plotting
     plt.figure(figsize=(10, 6))
     for _, row in merged_stats.iterrows():
-        plt.errorbar(x=row['mean_brevity'], y=row['mean_quality'],
-                    xerr=row['ci_90_brevity'], yerr=row['ci_90_quality'],
-                    fmt='o', capsize=5, label=row['model'])
+        plt.errorbar(
+            x=row['mean_brevity'],
+            y=row['mean_quality'],
+            xerr=row['ci_90_brevity'],
+            yerr=row['ci_90_quality'],
+            fmt='o',
+            capsize=5,
+            label=row['model']
+        )
 
     plt.xlabel('Mean Brevity Score')
     plt.ylabel('Mean Quality Score')
-    plt.title('GPT4 winrates for quality (helpfulness) vs brevity (90% CI)')
-    plt.legend(bbox_to_anchor=(0, 0.2), loc='upper left')
+    plt.title(f'{ds.upper()}: GPT4 winrates for quality (helpfulness) vs brevity (90% CI)')
+    plt.legend()
     plt.grid(True)
-    plt.savefig("winrates_scatter.png", dpi=200, bbox_inches='tight')
+    plt.savefig(f"{ds.lower()}_scatter.png", dpi=200, bbox_inches='tight')
 
 
 if __name__ == "__main__":
