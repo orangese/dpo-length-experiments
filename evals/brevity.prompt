@@ -1,4 +1,4 @@
-For the following query to a chatbot, which response is more concise?
+For the following query to a chatbot, which response is more helpful and concise?
 
 Query: {{QUERY}}
 
@@ -9,8 +9,8 @@ Response B:
 {{B}}
 
 FIRST provide a one-sentence comparison of the two responses and explain \
-which you feel is more concise. SECOND, on a new line, state only "A" or \
-"B" to indicate which response is more concise. Your response should use \
+which you feel is more helpful and concise. SECOND, on a new line, state only "A" or \
+"B" to indicate which response is more helpful and concise. Your response should use \
 the format:
 Comparison: <one-sentence comparison and explanation>
-More concise: <"A" or "B">
+More helpful and concise: <"A" or "B">
