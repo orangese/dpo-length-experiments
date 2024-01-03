@@ -19,9 +19,15 @@ from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 import tensor_parallel as tp
 import contextlib
 
-from preference_datasets import get_batch_iterator, xla_get_dataloader
+import torch_xla.core.xla_model as xm
+from torch_xla.distributed.fsdp import (
+    XlaFullyShardedDataParallel as FSDP,
+    consolidate_sharded_model_checkpoints,
+    checkpoint_module,
+)
+from torch_xla.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
-# TODO: get rid of slice, gather, rank0_print
+from preference_datasets import get_batch_iterator, xla_get_dataloader
 from utils import (
     slice_and_move_batch_for_device,
     formatted_dict,
@@ -30,6 +36,7 @@ from utils import (
     get_block_class_from_model,
     rank0_print,
     get_local_dir,
+    USING_XLA
 )
 import numpy as np
 import wandb
@@ -146,23 +153,21 @@ def concatenated_inputs(batch: Dict[str, Union[List, torch.LongTensor]]) -> Dict
 
 
 class BasicTrainer(object):
-    def __init__(self, policy: nn.Module, config: DictConfig, seed: int, run_dir: str, reference_model: Optional[nn.Module] = None, rank: int = 0, world_size: int = 1, no_train: bool = False, xla: bool = False):
+    def __init__(self, policy: nn.Module, config: DictConfig, seed: int, run_dir: str, reference_model: Optional[nn.Module] = None, rank: int = 0, world_size: int = 1, no_train: bool = False):
         """A trainer for a language model, supporting either SFT or DPO training.
            
            If multiple GPUs are present, naively splits the model across them, effectively
            offering N times available memory, but without any parallel computation.
 
-           If TPUs are available (xla = True), you must use FDSP for training! BasicTrainer
-           will not work.
+           If TPUs are available (USING_XLA = True), you must use FDSPTrainerXLA for training! BasicTrainer
+           will not work, nor will TensorParallelTrainer.
         """
         self.seed = seed
         self.rank = rank
         self.world_size = world_size
         self.config = config
         self.run_dir = run_dir
-        self.xla = xla
-        if xla:
-            self.device = xm.xla_device()
+        if USING_XLA:
             assert not self.config.sample_during_eval, "sampling during training not supported with xla"
 
         tokenizer_name_or_path = config.model.tokenizer_name_or_path or config.model.name_or_path
@@ -184,19 +189,19 @@ class BasicTrainer(object):
         self.reference_model = reference_model
         
         dataloader_fn = get_batch_iterator
-        if self.xla:
+        if USING_XLA:
             dataloader_fn = xla_get_dataloader
             data_iterator_kwargs["device"] = xm.xla_device()
 
         if not no_train:
             self.train_iterator = dataloader_fn(**data_iterator_kwargs, split='train', n_epochs=config.n_epochs, n_examples=config.n_examples, batch_size=config.batch_size, silent=rank != 0, cache_dir=get_local_dir(config.local_dirs))
-            rank0_print(f'Loaded train data iterator')
+            rank0_print(f'Loaded train data iterator ({USING_XLA=})')
         else:
             self.train_iterator = None
             rank0_print('Did not load train data iterator')
 
         self.eval_iterator = get_batch_iterator(**data_iterator_kwargs, split='test', n_examples=config.n_eval_examples, batch_size=config.eval_batch_size, silent=rank != 0, cache_dir=get_local_dir(config.local_dirs))
-        if self.xla:
+        if not USING_XLA:
             self.eval_batches = None
             rank0_print(f'Loaded {len(self.eval_batches)} eval batches of size {config.eval_batch_size}')
         else:
@@ -243,8 +248,7 @@ class BasicTrainer(object):
         rejected_logps = all_logps[batch['chosen_input_ids'].shape[0]:]
         return chosen_logps, rejected_logps
 
-
-    def get_batch_metrics(self, batch: Dict[str, Union[List, torch.LongTensor]], loss_config: DictConfig, train=True):
+    def get_batch_metrics(self, batch: Dict[str, Union[List, torch.LongTensor]], loss_config: DictConfig, train=True, lazy=False):
         """Compute the SFT or DPO loss and other metrics for the given batch of inputs."""
 
         metrics = {}
@@ -265,16 +269,19 @@ class BasicTrainer(object):
             )
             reward_accuracies = (chosen_rewards > rejected_rewards).float()
 
-            chosen_rewards = all_gather_if_needed(chosen_rewards, self.rank, self.world_size)
-            rejected_rewards = all_gather_if_needed(rejected_rewards, self.rank, self.world_size)
-            reward_accuracies = all_gather_if_needed(reward_accuracies, self.rank, self.world_size)
+            if not lazy:
+                chosen_rewards = all_gather_if_needed(chosen_rewards, self.rank, self.world_size)
+                rejected_rewards = all_gather_if_needed(rejected_rewards, self.rank, self.world_size)
+                reward_accuracies = all_gather_if_needed(reward_accuracies, self.rank, self.world_size)
 
             metrics[f'rewards_{train_test}/chosen'] = chosen_rewards.cpu().numpy().tolist()
             metrics[f'rewards_{train_test}/rejected'] = rejected_rewards.cpu().numpy().tolist()
             metrics[f'rewards_{train_test}/accuracies'] = reward_accuracies.cpu().numpy().tolist()
             metrics[f'rewards_{train_test}/margins'] = (chosen_rewards - rejected_rewards).cpu().numpy().tolist()
 
-            policy_rejected_logps = all_gather_if_needed(policy_rejected_logps.detach(), self.rank, self.world_size)
+            policy_rejected_logps = policy_rejected_logps.detach()
+            if not lazy:
+                policy_rejected_logps = all_gather_if_needed(policy_rejected_logps, self.rank, self.world_size)
             metrics[f'logps_{train_test}/rejected'] = policy_rejected_logps.cpu().numpy().tolist()
 
         elif loss_config.name == 'sft':
@@ -283,11 +290,15 @@ class BasicTrainer(object):
 
             losses = -policy_chosen_logps
 
-        policy_chosen_logps = all_gather_if_needed(policy_chosen_logps.detach(), self.rank, self.world_size)
+        policy_chosen_logps = policy_chosen_logps.detach()
+        if not lazy:
+            policy_chosen_logps = all_gather_if_needed(policy_chosen_logps, self.rank, self.world_size)
         metrics[f'logps_{train_test}/chosen'] = policy_chosen_logps.cpu().numpy().tolist()
 
-        all_devices_losses = all_gather_if_needed(losses.detach(), self.rank, self.world_size)
-        metrics[f'loss/{train_test}'] = all_devices_losses.cpu().numpy().tolist()
+        losses_view = losses.detach()
+        if not lazy:
+            losses_view = all_gather_if_needed(losses_view, self.rank, self.world_size)
+        metrics[f'loss/{train_test}'] = losses_view.cpu().numpy().tolist()
 
         return losses.mean(), metrics
 
@@ -319,6 +330,120 @@ class BasicTrainer(object):
                         result[prompt] = [sample]
 
         return result
+    
+    @torch.no_grad
+    def do_eval(self):
+        """Run evaluation on the evaluation set, gathering metrics from all processes and logging only on the master rank process."""
+        rank0_print(f'Running evaluation after {self.example_counter} train examples')
+        self.policy.eval()
+
+        all_eval_metrics = defaultdict(list)
+        if self.config.sample_during_eval:
+            all_policy_samples, all_reference_samples = [], []
+            policy_text_table = wandb.Table(columns=["step", "prompt", "sample"])
+            if self.config.loss.name == 'dpo':
+                reference_text_table = wandb.Table(columns=["step", "prompt", "sample"])
+        
+        if self.rank == 0:
+            eval_iter = tqdm.tqdm(self.eval_iterator, desc="Computing eval metrics")
+        else:
+            eval_iter = self.eval_iterator
+    
+        for eval_batch in eval_iter:
+            local_eval_batch = slice_and_move_batch_for_device(eval_batch, self.rank, self.world_size, self.rank)
+            with torch.no_grad():
+                _, eval_metrics = self.get_batch_metrics(local_eval_batch, self.config.loss, train=False)
+            for k, v in eval_metrics.items():
+                all_eval_metrics[k].extend(v)
+ 
+        if self.config.sample_during_eval:
+            if self.config.n_eval_model_samples < self.config.eval_batch_size:
+                rank0_print(f'Warning: n_eval_model_samples ({self.config.n_eval_model_samples}) < eval_batch_size ({self.config.eval_batch_size}). Sampling from the first complete eval batch of prompts.')
+                sample_batches = self.eval_batches[:1]
+            else:
+                n_sample_batches = self.config.n_eval_model_samples // self.config.eval_batch_size
+                sample_batches = self.eval_batches[:n_sample_batches]
+            for eval_batch in (tqdm.tqdm(sample_batches, desc='Generating samples...') if self.rank == 0 else sample_batches):
+                local_eval_batch = slice_and_move_batch_for_device(eval_batch, self.rank, self.world_size, self.rank)
+                policy_samples, reference_samples = self.get_batch_samples(
+                    local_eval_batch,
+                    use_reference=self.config.loss.name == 'dpo'
+                )
+
+                all_policy_samples.extend(policy_samples)
+                all_reference_samples.extend(reference_samples)
+
+                for prompt, sample in zip(eval_batch['prompt'], policy_samples):
+                    policy_text_table.add_data(self.example_counter, prompt, sample)
+                if self.config.loss.name == 'dpo':
+                    for prompt, sample in zip(eval_batch['prompt'], reference_samples):
+                        reference_text_table.add_data(self.example_counter, prompt, sample)
+
+        mean_eval_metrics = {k: sum(v) / len(v) for k, v in all_eval_metrics.items()}
+        rank0_print(f'eval after {self.example_counter}: {formatted_dict(mean_eval_metrics)}')
+        if self.config.sample_during_eval:                    
+            rank0_print(json.dumps(all_policy_samples[:10], indent=2))
+            if self.config.loss.name == 'dpo':
+                rank0_print(json.dumps(all_reference_samples[:10], indent=2))
+
+        if self.config.wandb.enabled and self.rank == 0:
+            wandb.log(mean_eval_metrics, step=self.example_counter)
+            
+            if self.config.sample_during_eval:
+                wandb.log({"policy_samples": policy_text_table}, step=self.example_counter)
+                if self.config.loss.name == 'dpo':
+                    wandb.log({"reference_samples": reference_text_table}, step=self.example_counter)
+
+        if self.example_counter > 0:
+            if self.config.debug:
+                rank0_print('skipping save in debug mode')
+            else:
+                output_dir = os.path.join(self.run_dir, f'step-{self.example_counter}')
+                rank0_print(f'creating checkpoint to write to {output_dir}...')
+                self.save(output_dir, mean_eval_metrics)
+
+    def do_train(self, batch, last_log):
+        """Perform one training step on batch, non-FSDP."""
+        self.policy.train()
+
+        start_time = time.time()
+        batch_metrics = defaultdict(list)
+        for microbatch_idx in range(self.config.gradient_accumulation_steps):
+            global_microbatch = slice_and_move_batch_for_device(batch, microbatch_idx, self.config.gradient_accumulation_steps, self.rank)
+            local_microbatch = slice_and_move_batch_for_device(global_microbatch, self.rank, self.world_size, self.rank)
+            loss, metrics = self.get_batch_metrics(local_microbatch, self.config.loss, train=True)
+            (loss / self.config.gradient_accumulation_steps).backward()
+
+            for k, v in metrics.items():
+                batch_metrics[k].extend(v)
+
+        grad_norm = self.clip_gradient()
+        self.optimizer.step()
+        self.scheduler.step()
+        self.optimizer.zero_grad()
+
+        step_time = time.time() - start_time
+        examples_per_second = self.config.batch_size / step_time
+        batch_metrics['examples_per_second'].append(examples_per_second)
+        batch_metrics['grad_norm'].append(grad_norm)
+
+        self.batch_counter += 1
+        self.example_counter += self.config.batch_size
+
+        if last_log is None or time.time() - last_log > self.config.minimum_log_interval_secs:
+            mean_train_metrics = {k: sum(v) / len(v) for k, v in batch_metrics.items()}
+            mean_train_metrics['counters/examples'] = self.example_counter
+            mean_train_metrics['counters/updates'] = self.batch_counter
+            rank0_print(f'train stats after {self.example_counter} examples: {formatted_dict(mean_train_metrics)}')
+
+            if self.config.wandb.enabled and self.rank == 0:
+                wandb.log(mean_train_metrics, step=self.example_counter)
+
+            last_log = time.time()
+        else:
+            rank0_print(f'skipping logging after {self.example_counter} examples to avoid logging too frequently')
+
+        return last_log
 
     def train(self):
         """Begin either SFT or DPO training, with periodic evaluation."""
@@ -341,117 +466,21 @@ class BasicTrainer(object):
         if self.train_iterator is None:
             raise ValueError("No train iterator loaded, cannot train")
 
-        for batch in self.train_iterator:
-            #### BEGIN EVALUATION ####
-            if self.example_counter % self.config.eval_every == 0 and (self.example_counter > 0 or self.config.do_first_eval):
-                with torch.no_grad():
-                    rank0_print(f'Running evaluation after {self.example_counter} train examples')
-                    self.policy.eval()
-
-                    all_eval_metrics = defaultdict(list)
-                    if self.config.sample_during_eval:
-                        all_policy_samples, all_reference_samples = [], []
-                        policy_text_table = wandb.Table(columns=["step", "prompt", "sample"])
-                        if self.config.loss.name == 'dpo':
-                            reference_text_table = wandb.Table(columns=["step", "prompt", "sample"])
-
-                    eval_batches = self.eval_iterator if self.xla else self.eval_batches
-                    for eval_batch in (tqdm.tqdm(eval_batches, desc='Computing eval metrics') if self.rank == 0 else eval_batches):
-                        local_eval_batch = slice_and_move_batch_for_device(eval_batch, self.rank, self.world_size, self.rank)
-                        with torch.no_grad():
-                            _, eval_metrics = self.get_batch_metrics(local_eval_batch, self.config.loss, train=False)
-
-                        for k, v in eval_metrics.items():
-                            all_eval_metrics[k].extend(v)
-
-                    if self.config.sample_during_eval:
-                        if self.config.n_eval_model_samples < self.config.eval_batch_size:
-                            rank0_print(f'Warning: n_eval_model_samples ({self.config.n_eval_model_samples}) < eval_batch_size ({self.config.eval_batch_size}). Sampling from the first complete eval batch of prompts.')
-                            sample_batches = self.eval_batches[:1]
-                        else:
-                            n_sample_batches = self.config.n_eval_model_samples // self.config.eval_batch_size
-                            sample_batches = self.eval_batches[:n_sample_batches]
-                        for eval_batch in (tqdm.tqdm(sample_batches, desc='Generating samples...') if self.rank == 0 else sample_batches):
-                            local_eval_batch = slice_and_move_batch_for_device(eval_batch, self.rank, self.world_size, self.rank)
-                            policy_samples, reference_samples = self.get_batch_samples(
-                                local_eval_batch,
-                                use_reference=self.config.loss.name == 'dpo'
-                            )
-
-                            all_policy_samples.extend(policy_samples)
-                            all_reference_samples.extend(reference_samples)
-
-                            for prompt, sample in zip(eval_batch['prompt'], policy_samples):
-                                policy_text_table.add_data(self.example_counter, prompt, sample)
-                            if self.config.loss.name == 'dpo':
-                                for prompt, sample in zip(eval_batch['prompt'], reference_samples):
-                                    reference_text_table.add_data(self.example_counter, prompt, sample)
-
-                    mean_eval_metrics = {k: sum(v) / len(v) for k, v in all_eval_metrics.items()}
-                    rank0_print(f'eval after {self.example_counter}: {formatted_dict(mean_eval_metrics)}')
-                    if self.config.sample_during_eval:                    
-                        rank0_print(json.dumps(all_policy_samples[:10], indent=2))
-                        if self.config.loss.name == 'dpo':
-                            rank0_print(json.dumps(all_reference_samples[:10], indent=2))
-
-                    if self.config.wandb.enabled and self.rank == 0:
-                        wandb.log(mean_eval_metrics, step=self.example_counter)
-
-                        if self.config.sample_during_eval:
-                            wandb.log({"policy_samples": policy_text_table}, step=self.example_counter)
-                            if self.config.loss.name == 'dpo':
-                                wandb.log({"reference_samples": reference_text_table}, step=self.example_counter)
-
-                    if self.example_counter > 0:
-                        if self.config.debug:
-                            rank0_print('skipping save in debug mode')
-                        else:
-                            output_dir = os.path.join(self.run_dir, f'step-{self.example_counter}')
-                            rank0_print(f'creating checkpoint to write to {output_dir}...')
-                            self.save(output_dir, mean_eval_metrics)
-            #### END EVALUATION ####
-
-            #### BEGIN TRAINING ####
-            self.policy.train()
-
-            start_time = time.time()
-            batch_metrics = defaultdict(list)
-            for microbatch_idx in range(self.config.gradient_accumulation_steps):
-                global_microbatch = slice_and_move_batch_for_device(batch, microbatch_idx, self.config.gradient_accumulation_steps, self.rank)
-                local_microbatch = slice_and_move_batch_for_device(global_microbatch, self.rank, self.world_size, self.rank)
-                loss, metrics = self.get_batch_metrics(local_microbatch, self.config.loss, train=True)
-                (loss / self.config.gradient_accumulation_steps).backward()
-
-                for k, v in metrics.items():
-                    batch_metrics[k].extend(v)
-
-            grad_norm = self.clip_gradient()
-            self.optimizer.step()
-            self.scheduler.step()
-            self.optimizer.zero_grad()
-
-            step_time = time.time() - start_time
-            examples_per_second = self.config.batch_size / step_time
-            batch_metrics['examples_per_second'].append(examples_per_second)
-            batch_metrics['grad_norm'].append(grad_norm)
-
-            self.batch_counter += 1
-            self.example_counter += self.config.batch_size
-
-            if last_log is None or time.time() - last_log > self.config.minimum_log_interval_secs:
-                mean_train_metrics = {k: sum(v) / len(v) for k, v in batch_metrics.items()}
-                mean_train_metrics['counters/examples'] = self.example_counter
-                mean_train_metrics['counters/updates'] = self.batch_counter
-                rank0_print(f'train stats after {self.example_counter} examples: {formatted_dict(mean_train_metrics)}')
-
-                if self.config.wandb.enabled and self.rank == 0:
-                    wandb.log(mean_train_metrics, step=self.example_counter)
-
-                last_log = time.time()
-            else:
-                rank0_print(f'skipping logging after {self.example_counter} examples to avoid logging too frequently')
-            #### END TRAINING ####
-
+        n_epochs = 0
+        while True:
+            for batch in self.train_iterator:
+                if self.example_counter % self.config.eval_every == 0 and (self.example_counter > 0 or self.config.do_first_eval):
+                    self.do_eval()
+                last_log = self.do_train(batch, last_log)
+            
+                if self.config.max_examples is not None and self.example_counter >= self.config.max_examples:
+                    rank0_print(f'reached max_examples ({self.config.max_examples}), exiting')
+                    return
+            
+            n_epochs += 1
+            if self.config.n_epochs is not None and n_epochs >= self.config.n_epochs:
+                rank0_print(f'reached n_epochs ({self.config.n_epochs}), exiting')
+                return
 
     def clip_gradient(self):
         """Clip the gradient norm of the parameters of a non-FSDP policy."""
@@ -470,7 +499,7 @@ class BasicTrainer(object):
             'state': state,
             'metrics': metrics if metrics is not None else {},
         }, output_path)
-    
+
     def save(self, output_dir: Optional[str] = None, metrics: Optional[Dict] = None):
         """Save policy, optimizer, and scheduler state to disk."""
 
@@ -553,7 +582,6 @@ class FSDPTrainer(BasicTrainer):
         """Clip the gradient norm of the parameters of an FSDP policy, gathering the gradients across all GPUs."""
         return self.policy.clip_grad_norm_(self.config.max_grad_norm).item()
    
-    # TODO: rewrite with fsdp sharded tpu
     def save(self, output_dir=None, metrics=None):
         """Save policy, optimizer, and scheduler state to disk, gathering from all processes and saving only on the rank 0 process."""
         save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
@@ -608,7 +636,7 @@ class FSDPTrainerXLA(BasicTrainer):
         auto_wrap_callable = None
         if config.activation_checkpointing:
             rank0_print("Enabling activation checkpointing")
-            auto_wrap_callable = lambad m, *args, **kwargs: FSDP(
+            auto_wrap_callable = lambda m, *args, **kwargs: FSDP(
                 checkpoint_module(m), *args, **kwargs
             )
 
@@ -622,7 +650,7 @@ class FSDPTrainerXLA(BasicTrainer):
             m,
             compute_dtype=mp_dtype,
             auto_wrap_policy=auto_wrap_policy,
-            auto_wrapper_callable=auto_wrapper_callable
+            auto_wrapper_callable=auto_wrap_callable
         )
         self.policy = fsdp_wrap(policy)
 
@@ -630,49 +658,141 @@ class FSDPTrainerXLA(BasicTrainer):
             rank0_print('Sharding reference model...')
             self.reference_model = fsdp_wrap(reference_model)
 
-        print('Loaded model on rank', xm.xla_device())
-#        shared_fsdp_kwargs = dict(
-#            auto_wrap_policy=model_auto_wrap_policy,
-#            sharding_strategy=ShardingStrategy.FULL_SHARD,
-#            cpu_offload=CPUOffload(offload_params=False),
-#            backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
-#            device_id=rank,
-#            ignored_modules=None,
-#            limit_all_gathers=False,
-#            use_orig_params=False,
-#            sync_module_states=False
-#        )
+        print('Loaded model on rank', device)
+    
+    @staticmethod
+    def _reduce_dict(dict_list):
+        """Given list of dicts with same key sets, reduces into one dict by taking the 
+        average over each key. Each key in each dict will map to a list of values."""
+        result = {}
+        for k in dict_list[0].keys():
+            result[k] = []
+            for d in dict_list:
+                result[k].extend(d[k])
+        return {k: sum(v) / len(v) for k, v in result.items()}
 
+    @torch.no_grad
+    def do_eval(self):
+        """Run evaluation on the evaluation set, gathering metrics from all processes and logging only on the master rank process."""
+        self.policy.eval()
+        rank0_print(f'Running evaluation after {self.example_counter} train examples')
+
+        all_eval_metrics = defaultdict(list)
+        if xm.is_master_ordinal(local=False):
+            eval_iter = tqdm.tqdm(self.eval_iterator, desc="Computing eval metrics")
+        else:
+            eval_iter = self.eval_iterator
+    
+        for local_eval_batch in eval_iter:
+            # already sliced and moved to correct XLA device by the data loader
+            _, eval_metrics = self.get_batch_metrics(local_eval_batch, self.config.loss, train=False, lazy=True)
+            for k, v in eval_metrics.items():
+                all_eval_metrics[k].extend(v)
+
+        # now we can mesh reduce across all processes
+        mean_eval_metrics = xm.mesh_reduce('eval_metrics', all_eval_metrics, FSDPTrainerXLA._reduce_dict)
+        rank0_print(f'eval after {self.example_counter}: {formatted_dict(mean_eval_metrics)}')
+
+        # log if appropriate
+        if self.config.wandb.enabled and xm.is_master_ordinal(local=False):
+            wandb.log(mean_eval_metrics, step=self.example_counter)
+
+        if self.example_counter > 0:
+            if self.config.debug:
+                rank0_print('skipping save in debug mode')
+            else:
+                output_dir = os.path.join(self.run_dir, f'step-{self.example_counter}')
+                rank0_print(f'creating checkpoint to write to {output_dir}...')
+                self.save(output_dir, mean_eval_metrics)
+
+    def do_train(self, batch, last_log):
+        """Perform one training step on batch, FSDP."""
+
+        def log_train_metrics(device, example_counter, batch_counter, batch_metrics, wandb_enabled):
+            mean_train_metrics = xm.mesh_reduce('train_metrics', batch_metrics, FSDPTrainerXLA._reduce_dict)
+            mean_train_metrics['counters/examples'] = example_counter
+            mean_train_metrics['counters/updates'] = batch_counter
+            rank0_print(f'[{device}] train stats after {example_counter} examples: {formatted_dict(mean_train_metrics)}')
+
+            if wandb_enabled and xm.is_master_ordinal(local=False):
+                wandb.log(mean_train_metrics, step=example_counter)
+
+        self.policy.train()
+        start_time = time.time()
+        batch_metrics = defaultdict(list)
+
+        chunk_size = self.config.batch_size // self.config.gradient_accumulation_steps
+        for idx in range(self.config.gradient_accumulation_steps):
+            # No need to slice the batch for device movement, since it's already on the correct XLA device
+            # Slicing is solely for the purpose of gradient accumulation here
+            end = (idx + 1) * chunk_size
+            if self.config.batch_size - end < chunk_size:
+                end = self.config.batch_size
+
+            microbatch = {k: v[slice(idx * chunk_size, end)] for k, v in batch.items()}
+            loss, metrics_microbatch = self.get_batch_metrics(microbatch, self.config.loss, train=True, lazy=True)
+            (loss / self.config.gradient_accumulation_steps).backward()
+
+            for k, v in metrics_microbatch.items():
+                batch_metrics[k].append(v)
+
+        # clip gradients and update parameters
+        grad_norm = self.clip_gradient()
+        self.optimizer.step()
+        self.scheduler.step()
+        self.optimizer.zero_grad()
+
+        # gather metrics and log them
+        step_time = time.time() - start_time
+        examples_per_second = self.config.batch_size / step_time
+        batch_metrics['examples_per_second'].append(examples_per_second)
+        batch_metrics['grad_norm'].append(grad_norm)
+
+        self.batch_counter += 1
+        self.example_counter += self.config.batch_size
+
+        # should use add_step_closure so that performance doesn't take a hit from accessing intermediate tensors
+        if last_log is None or time.time() - last_log > self.config.minimum_log_interval_secs:
+            xm.add_step_closure(
+                log_train_metrics,
+                args=(xm.xla_device(), self.example_counter, self.batch_counter, batch_metrics, self.config.wandb.enabled),
+            )
+            last_log = time.time()
+
+        return last_log
+    
     def clip_gradient(self):
         """Clip the gradient norm of the parameters of an FSDP policy, gathering the gradients across all GPUs."""
         return self.policy.clip_grad_norm_(self.config.max_grad_norm).item()
-   
-    # TODO: rewrite with fsdp sharded tpu
+    
     def save(self, output_dir=None, metrics=None):
-        """Save policy, optimizer, and scheduler state to disk, gathering from all processes and saving only on the rank 0 process."""
-        save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-        with FSDP.state_dict_type(self.policy, StateDictType.FULL_STATE_DICT, state_dict_config=save_policy):
-            policy_state_dict = self.policy.state_dict()
+        """Save policy, optimizer, and scheduler state to disk."""
+        # Save model checkpoint
+        rank = xm.get_ordinal()
+        world_size = xm.xrt_world_size()
+        ckpt_prefix = f"{output_dir}/iter-{self.example_counter}"
 
-        if self.rank == 0:
-            self.write_state_dict(self.example_counter, policy_state_dict, metrics, 'policy.pt', output_dir)
-        del policy_state_dict
-        dist.barrier()
+        ckpt_path = f'{ckpt_prefix}_rank-{rank:08d}-of-{world_size:08d}.pth'
+        ckpt = {
+            'model': self.policy.state_dict(),
+            'shard_metadata': self.policy.get_shard_metadata(),
+            'optimizer': self.optimizer.state_dict(),  # not needed in ckpt consolidation
+            'step_idx': self.example_counter,  # not needed in ckpt consolidation
+            'metrics': metrics if metrics is not None else {},  # not needed in ckpt consolidation
+        }
+        os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
+        xm.save(ckpt, ckpt_path, master_only=False)
+        print(f'checkpoint saved to {ckpt_path}\n', end='')
 
-        save_policy = FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True)
-        with FSDP.state_dict_type(self.policy, StateDictType.FULL_STATE_DICT, optim_state_dict_config=save_policy):
-            optimizer_state_dict = FSDP.optim_state_dict(self.policy, self.optimizer)
-
-        if self.rank == 0:
-            self.write_state_dict(self.example_counter, optimizer_state_dict, metrics, 'optimizer.pt', output_dir)
-        del optimizer_state_dict
-        dist.barrier()
-
-        if self.rank == 0:
-            scheduler_state_dict = self.scheduler.state_dict()
-            self.write_state_dict(self.example_counter, scheduler_state_dict, metrics, 'scheduler.pt', output_dir)
-        dist.barrier()
-        
+         # Consolidate the sharded model checkpoints
+        if xm.is_master_ordinal(local=False):
+            consolidate_sharded_model_checkpoints(
+                ckpt_prefix=ckpt_prefix,
+                ckpt_suffix="_rank-*-of-*.pth"
+            )
+            rank0_print(f'consolidated checkpoint saved to {ckpt_prefix}_consolidated.pth\n', end='')
+        xm.rendezvous('ckpt_consolidation')
+ 
 
 class TensorParallelTrainer(BasicTrainer):
     def __init__(self, policy, config, seed, run_dir, reference_model=None, rank=0, world_size=1):

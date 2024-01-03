@@ -2,10 +2,12 @@ import torch
 torch.backends.cuda.matmul.allow_tf32 = True
 import torch.nn as nn
 import transformers
-from utils import get_local_dir, get_local_run_dir, disable_dropout, init_distributed, get_open_port
+from utils import get_local_dir, get_local_run_dir, disable_dropout, init_distributed, get_open_port, USING_XLA
 import os
 import hydra
 import torch.multiprocessing as mp
+import torch_xla.distributed.xla_multiprocessing as xmp
+import torch_xla.core.xla_model as xm
 from omegaconf import OmegaConf, DictConfig
 import trainers
 import wandb
@@ -30,17 +32,16 @@ def worker_sample(rank: int, world_size: int, config: DictConfig, policy: nn.Mod
     print(f'Saved samples on {len(to_save)} eval prompts to {config.sample_path}')
 
 
-# TODO: rewrite for xla tpu and pjrt runtime
 def worker_main(rank: int, world_size: int, config: DictConfig, policy: nn.Module, reference_model: Optional[nn.Module] = None):
     """Main function for each worker process (may be only 1 for BasicTrainer/TensorParallelTrainer)."""
-    if 'FSDP' in config.trainer:
+    if 'FSDP' in config.trainer and not USING_XLA:
         init_distributed(rank, world_size, port=config.fsdp_port)
-    
+ 
     if config.debug:
         wandb.init = lambda *args, **kwargs: None
         wandb.log = lambda *args, **kwargs: None
 
-    if rank == 0 and config.wandb.enabled:
+    if config.wandb.enabled and ((not USING_XLA and rank == 0) or (USING_XLA and xm.is_master_ordinal(local=False))):
         os.environ['WANDB_CACHE_DIR'] = get_local_dir(config.local_dirs)
         wandb.init(
             entity=config.wandb.entity,
@@ -68,13 +69,19 @@ def main(config: DictConfig):
     missing_keys: Set[str] = OmegaConf.missing_keys(config)
     if missing_keys:
         raise ValueError(f"Got missing keys in config:\n{missing_keys}")
+    
+    global USING_XLA
+    USING_XLA = config.use_tpu
+    print("NOTE: USING_XLA:", USING_XLA)
+    if USING_XLA:
+        print("NOTE: FSDP implementation differs on TPU vs GPU; using XLA implementation")
 
     if config.eval_every % config.batch_size != 0:
         print('WARNING: eval_every must be divisible by batch_size')
         print('Setting eval_every to', config.eval_every - config.eval_every % config.batch_size)
         config.eval_every = config.eval_every - config.eval_every % config.batch_size
 
-    if 'FSDP' in config.trainer and config.fsdp_port is None:
+    if not USING_XLA and 'FSDP' in config.trainer and config.fsdp_port is None:
         free_port = get_open_port()
         print('no FSDP port specified; using open port for FSDP:', free_port)
         config.fsdp_port = free_port
@@ -116,17 +123,25 @@ def main(config: DictConfig):
         print('loaded pre-trained weights')
 
     if config.sample_only:
+        assert not USING_XLA, 'sampling not supported on TPU'
         print(f'not training, just sampling (saving to {config.sample_path})')
         worker_sample(0, 1, config, policy)
         return
     
     if 'FSDP' in config.trainer:
-        world_size = torch.cuda.device_count()
-        print('starting', world_size, 'processes for FSDP training')
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
         resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
         print(f'setting RLIMIT_NOFILE soft limit to {hard} from {soft}')
-        mp.spawn(worker_main, nprocs=world_size, args=(world_size, config, policy, reference_model), join=True)
+    
+        if USING_XLA:
+            print(f'starting {xm.xrt_world_size()} processes for FSDP training')
+            xmp.spawn(worker_main, args=(1, config, policy, reference_model), nprocs=xm.xrt_world_size())
+
+        else:
+            world_size = torch.cuda.device_count()
+            print('starting', world_size, 'processes for FSDP training')
+            mp.spawn(worker_main, nprocs=world_size, args=(world_size, config, policy, reference_model), join=True)
+
     else:
         print('starting single-process worker')
         worker_main(0, 1, config, policy, reference_model)

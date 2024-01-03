@@ -3,8 +3,7 @@ import datasets
 import os
 import json
 import torch
-from torch.utils.data import DataLoader, Dataset
-from utils import get_local_dir, TemporarilySeededRandom
+from utils import TemporarilySeededRandom
 from torch.nn.utils.rnn import pad_sequence
 from collections import defaultdict
 import tqdm
@@ -12,6 +11,8 @@ import random
 from bs4 import BeautifulSoup, NavigableString
 import numpy as np
 from typing import Dict, List, Optional, Iterator, Callable, Union, Tuple
+import torch_xla.core.xla_model as xm
+import torch_xla.distributed.parallel_loader as pl
 
 
 def extract_anthropic_prompt(prompt_and_response):
@@ -460,7 +461,8 @@ class MapStyleDataset:
         max_length,
         max_prompt_length,
         sft_mode,
-        truncation_mode
+        silent,
+        cache_dir
     ):
         self.data = []
         
@@ -481,9 +483,9 @@ class MapStyleDataset:
                         max_length,
                         max_prompt_length
                     )
-                    self.data.append({k: v for k, v in element.items() if 'rejected' not in k})
+                    self.data.append({k: v for k, v in elem.items() if 'rejected' not in k})
                 
-                 else:
+                else:
                     for p in pairs:
                         elem = tokenize_batch_element(
                             prompt,
@@ -553,7 +555,8 @@ def xla_get_dataloader(names: List[str],
         max_length,
         max_prompt_length,
         sft_mode,
-        truncation_mode
+        silent,
+        cache_dir
     )
 
     # Finally, create torch dataloader and move to proper device
@@ -563,7 +566,8 @@ def xla_get_dataloader(names: List[str],
             ds,
             num_replicas=xm.xrt_world_size(),
             rank=xm.get_ordinal(),
-            shuffle=shuffle
+            shuffle=shuffle,
+            seed=seed
         )
 
     dataloader = torch.utils.data.DataLoader(

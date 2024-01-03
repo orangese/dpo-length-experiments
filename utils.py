@@ -5,11 +5,14 @@ import torch
 import random
 import numpy as np
 import torch.distributed as dist
+import torch_xla.core.xla_model as xm
 import inspect
 import importlib.util
 import socket
 import os
 from typing import Dict, Union, Type, List
+
+USING_XLA = False
 
 
 def get_open_port():
@@ -39,6 +42,8 @@ def get_remote_file(remote_path, local_path=None):
 
 def rank0_print(*args, **kwargs):
     """Print, but only on rank 0."""
+    if USING_XLA:
+        xm.master_print(*args, **kwargs)
     if not dist.is_initialized() or dist.get_rank() == 0:
         print(*args, **kwargs)
 
@@ -63,6 +68,10 @@ def get_local_run_dir(exp_name: str, local_dirs: List[str]) -> str:
 
 def slice_and_move_batch_for_device(batch: Dict, rank: int, world_size: int, device: str) -> Dict:
     """Slice a batch into chunks, and move each chunk to the specified device."""
+    if USING_XLA:
+        # this should never be called with xla since preference_datasets has a native distrbuted dataloader
+        raise NotImplementedError("slice_and_move_batch_for_device not implemented for XLA")
+    
     chunk_size = len(list(batch.values())[0]) // world_size
     start = chunk_size * rank
     end = chunk_size * (rank + 1)
@@ -82,6 +91,10 @@ def pad_to_length(tensor: torch.Tensor, length: int, pad_value: Union[int, float
 
 def all_gather_if_needed(values: torch.Tensor, rank: int, world_size: int) -> torch.Tensor:
     """Gather and stack/cat values from all processes, if there are multiple processes."""
+    if USING_XLA:
+        # this should never be called with xla to minimize communication between xmp processes
+        raise NotImplementedError("all_gather_if_needed not implemented for XLA")
+
     if world_size == 1:
         return values
 
@@ -101,20 +114,6 @@ def disable_dropout(model: torch.nn.Module):
     for module in model.modules():
         if isinstance(module, torch.nn.Dropout):
             module.p = 0
-
-
-def print_gpu_memory(rank: int = None, message: str = ''):
-    """Print the amount of GPU memory currently allocated for each GPU."""
-    if torch.cuda.is_available():
-        device_count = torch.cuda.device_count()
-        for i in range(device_count):
-            device = torch.device(f'cuda:{i}')
-            allocated_bytes = torch.cuda.memory_allocated(device)
-            if allocated_bytes == 0:
-                continue
-            print('*' * 40)
-            print(f'[{message} rank {rank} ] GPU {i}: {allocated_bytes / 1024**2:.2f} MB')
-        print('*' * 40)
 
 
 def get_block_class_from_model(model: torch.nn.Module, block_class_name: str) -> torch.nn.Module:
