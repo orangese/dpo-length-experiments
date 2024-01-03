@@ -19,7 +19,9 @@ from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 import tensor_parallel as tp
 import contextlib
 
-from preference_datasets import get_batch_iterator
+from preference_datasets import get_batch_iterator, xla_get_dataloader
+
+# TODO: get rid of slice, gather, rank0_print
 from utils import (
     slice_and_move_batch_for_device,
     formatted_dict,
@@ -144,17 +146,24 @@ def concatenated_inputs(batch: Dict[str, Union[List, torch.LongTensor]]) -> Dict
 
 
 class BasicTrainer(object):
-    def __init__(self, policy: nn.Module, config: DictConfig, seed: int, run_dir: str, reference_model: Optional[nn.Module] = None, rank: int = 0, world_size: int = 1, no_train: bool = False):
+    def __init__(self, policy: nn.Module, config: DictConfig, seed: int, run_dir: str, reference_model: Optional[nn.Module] = None, rank: int = 0, world_size: int = 1, no_train: bool = False, xla: bool = False):
         """A trainer for a language model, supporting either SFT or DPO training.
            
            If multiple GPUs are present, naively splits the model across them, effectively
            offering N times available memory, but without any parallel computation.
+
+           If TPUs are available (xla = True), you must use FDSP for training! BasicTrainer
+           will not work.
         """
         self.seed = seed
         self.rank = rank
         self.world_size = world_size
         self.config = config
         self.run_dir = run_dir
+        self.xla = xla
+        if xla:
+            self.device = xm.xla_device()
+            assert not self.config.sample_during_eval, "sampling during training not supported with xla"
 
         tokenizer_name_or_path = config.model.tokenizer_name_or_path or config.model.name_or_path
         rank0_print(f'Loading tokenizer {tokenizer_name_or_path}')
@@ -173,17 +182,26 @@ class BasicTrainer(object):
 
         self.policy = policy
         self.reference_model = reference_model
+        
+        dataloader_fn = get_batch_iterator
+        if self.xla:
+            dataloader_fn = xla_get_dataloader
+            data_iterator_kwargs["device"] = xm.xla_device()
 
         if not no_train:
-            self.train_iterator = get_batch_iterator(**data_iterator_kwargs, split='train', n_epochs=config.n_epochs, n_examples=config.n_examples, batch_size=config.batch_size, silent=rank != 0, cache_dir=get_local_dir(config.local_dirs))
+            self.train_iterator = dataloader_fn(**data_iterator_kwargs, split='train', n_epochs=config.n_epochs, n_examples=config.n_examples, batch_size=config.batch_size, silent=rank != 0, cache_dir=get_local_dir(config.local_dirs))
             rank0_print(f'Loaded train data iterator')
         else:
             self.train_iterator = None
             rank0_print('Did not load train data iterator')
 
         self.eval_iterator = get_batch_iterator(**data_iterator_kwargs, split='test', n_examples=config.n_eval_examples, batch_size=config.eval_batch_size, silent=rank != 0, cache_dir=get_local_dir(config.local_dirs))
-        self.eval_batches = list(self.eval_iterator)
-        rank0_print(f'Loaded {len(self.eval_batches)} eval batches of size {config.eval_batch_size}')
+        if self.xla:
+            self.eval_batches = None
+            rank0_print(f'Loaded {len(self.eval_batches)} eval batches of size {config.eval_batch_size}')
+        else:
+            self.eval_batches = list(self.eval_iterator)
+            rank0_print(f"Did not pre-load eval batches since running with XLA data loader")
 
     def get_batch_samples(self, batch: Dict[str, torch.LongTensor], use_reference: bool = False) -> Tuple[str, str]:
         """Generate samples from the policy (and reference model, if doing DPO training) for the given batch of inputs."""
@@ -326,69 +344,71 @@ class BasicTrainer(object):
         for batch in self.train_iterator:
             #### BEGIN EVALUATION ####
             if self.example_counter % self.config.eval_every == 0 and (self.example_counter > 0 or self.config.do_first_eval):
-                rank0_print(f'Running evaluation after {self.example_counter} train examples')
-                self.policy.eval()
+                with torch.no_grad():
+                    rank0_print(f'Running evaluation after {self.example_counter} train examples')
+                    self.policy.eval()
 
-                all_eval_metrics = defaultdict(list)
-                if self.config.sample_during_eval:
-                    all_policy_samples, all_reference_samples = [], []
-                    policy_text_table = wandb.Table(columns=["step", "prompt", "sample"])
-                    if self.config.loss.name == 'dpo':
-                        reference_text_table = wandb.Table(columns=["step", "prompt", "sample"])
-
-                for eval_batch in (tqdm.tqdm(self.eval_batches, desc='Computing eval metrics') if self.rank == 0 else self.eval_batches):
-                    local_eval_batch = slice_and_move_batch_for_device(eval_batch, self.rank, self.world_size, self.rank)
-                    with torch.no_grad():
-                        _, eval_metrics = self.get_batch_metrics(local_eval_batch, self.config.loss, train=False)
-
-                    for k, v in eval_metrics.items():
-                        all_eval_metrics[k].extend(v)
-
-                if self.config.sample_during_eval:
-                    if self.config.n_eval_model_samples < self.config.eval_batch_size:
-                        rank0_print(f'Warning: n_eval_model_samples ({self.config.n_eval_model_samples}) < eval_batch_size ({self.config.eval_batch_size}). Sampling from the first complete eval batch of prompts.')
-                        sample_batches = self.eval_batches[:1]
-                    else:
-                        n_sample_batches = self.config.n_eval_model_samples // self.config.eval_batch_size
-                        sample_batches = self.eval_batches[:n_sample_batches]
-                    for eval_batch in (tqdm.tqdm(sample_batches, desc='Generating samples...') if self.rank == 0 else sample_batches):
-                        local_eval_batch = slice_and_move_batch_for_device(eval_batch, self.rank, self.world_size, self.rank)
-                        policy_samples, reference_samples = self.get_batch_samples(
-                            local_eval_batch,
-                            use_reference=self.config.loss.name == 'dpo'
-                        )
-
-                        all_policy_samples.extend(policy_samples)
-                        all_reference_samples.extend(reference_samples)
-
-                        for prompt, sample in zip(eval_batch['prompt'], policy_samples):
-                            policy_text_table.add_data(self.example_counter, prompt, sample)
+                    all_eval_metrics = defaultdict(list)
+                    if self.config.sample_during_eval:
+                        all_policy_samples, all_reference_samples = [], []
+                        policy_text_table = wandb.Table(columns=["step", "prompt", "sample"])
                         if self.config.loss.name == 'dpo':
-                            for prompt, sample in zip(eval_batch['prompt'], reference_samples):
-                                reference_text_table.add_data(self.example_counter, prompt, sample)
+                            reference_text_table = wandb.Table(columns=["step", "prompt", "sample"])
 
-                mean_eval_metrics = {k: sum(v) / len(v) for k, v in all_eval_metrics.items()}
-                rank0_print(f'eval after {self.example_counter}: {formatted_dict(mean_eval_metrics)}')
-                if self.config.sample_during_eval:                    
-                    rank0_print(json.dumps(all_policy_samples[:10], indent=2))
-                    if self.config.loss.name == 'dpo':
-                        rank0_print(json.dumps(all_reference_samples[:10], indent=2))
+                    eval_batches = self.eval_iterator if self.xla else self.eval_batches
+                    for eval_batch in (tqdm.tqdm(eval_batches, desc='Computing eval metrics') if self.rank == 0 else eval_batches):
+                        local_eval_batch = slice_and_move_batch_for_device(eval_batch, self.rank, self.world_size, self.rank)
+                        with torch.no_grad():
+                            _, eval_metrics = self.get_batch_metrics(local_eval_batch, self.config.loss, train=False)
 
-                if self.config.wandb.enabled and self.rank == 0:
-                    wandb.log(mean_eval_metrics, step=self.example_counter)
+                        for k, v in eval_metrics.items():
+                            all_eval_metrics[k].extend(v)
 
                     if self.config.sample_during_eval:
-                        wandb.log({"policy_samples": policy_text_table}, step=self.example_counter)
-                        if self.config.loss.name == 'dpo':
-                            wandb.log({"reference_samples": reference_text_table}, step=self.example_counter)
+                        if self.config.n_eval_model_samples < self.config.eval_batch_size:
+                            rank0_print(f'Warning: n_eval_model_samples ({self.config.n_eval_model_samples}) < eval_batch_size ({self.config.eval_batch_size}). Sampling from the first complete eval batch of prompts.')
+                            sample_batches = self.eval_batches[:1]
+                        else:
+                            n_sample_batches = self.config.n_eval_model_samples // self.config.eval_batch_size
+                            sample_batches = self.eval_batches[:n_sample_batches]
+                        for eval_batch in (tqdm.tqdm(sample_batches, desc='Generating samples...') if self.rank == 0 else sample_batches):
+                            local_eval_batch = slice_and_move_batch_for_device(eval_batch, self.rank, self.world_size, self.rank)
+                            policy_samples, reference_samples = self.get_batch_samples(
+                                local_eval_batch,
+                                use_reference=self.config.loss.name == 'dpo'
+                            )
 
-                if self.example_counter > 0:
-                    if self.config.debug:
-                        rank0_print('skipping save in debug mode')
-                    else:
-                        output_dir = os.path.join(self.run_dir, f'step-{self.example_counter}')
-                        rank0_print(f'creating checkpoint to write to {output_dir}...')
-                        self.save(output_dir, mean_eval_metrics)
+                            all_policy_samples.extend(policy_samples)
+                            all_reference_samples.extend(reference_samples)
+
+                            for prompt, sample in zip(eval_batch['prompt'], policy_samples):
+                                policy_text_table.add_data(self.example_counter, prompt, sample)
+                            if self.config.loss.name == 'dpo':
+                                for prompt, sample in zip(eval_batch['prompt'], reference_samples):
+                                    reference_text_table.add_data(self.example_counter, prompt, sample)
+
+                    mean_eval_metrics = {k: sum(v) / len(v) for k, v in all_eval_metrics.items()}
+                    rank0_print(f'eval after {self.example_counter}: {formatted_dict(mean_eval_metrics)}')
+                    if self.config.sample_during_eval:                    
+                        rank0_print(json.dumps(all_policy_samples[:10], indent=2))
+                        if self.config.loss.name == 'dpo':
+                            rank0_print(json.dumps(all_reference_samples[:10], indent=2))
+
+                    if self.config.wandb.enabled and self.rank == 0:
+                        wandb.log(mean_eval_metrics, step=self.example_counter)
+
+                        if self.config.sample_during_eval:
+                            wandb.log({"policy_samples": policy_text_table}, step=self.example_counter)
+                            if self.config.loss.name == 'dpo':
+                                wandb.log({"reference_samples": reference_text_table}, step=self.example_counter)
+
+                    if self.example_counter > 0:
+                        if self.config.debug:
+                            rank0_print('skipping save in debug mode')
+                        else:
+                            output_dir = os.path.join(self.run_dir, f'step-{self.example_counter}')
+                            rank0_print(f'creating checkpoint to write to {output_dir}...')
+                            self.save(output_dir, mean_eval_metrics)
             #### END EVALUATION ####
 
             #### BEGIN TRAINING ####
@@ -532,7 +552,102 @@ class FSDPTrainer(BasicTrainer):
     def clip_gradient(self):
         """Clip the gradient norm of the parameters of an FSDP policy, gathering the gradients across all GPUs."""
         return self.policy.clip_grad_norm_(self.config.max_grad_norm).item()
-    
+   
+    # TODO: rewrite with fsdp sharded tpu
+    def save(self, output_dir=None, metrics=None):
+        """Save policy, optimizer, and scheduler state to disk, gathering from all processes and saving only on the rank 0 process."""
+        save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(self.policy, StateDictType.FULL_STATE_DICT, state_dict_config=save_policy):
+            policy_state_dict = self.policy.state_dict()
+
+        if self.rank == 0:
+            self.write_state_dict(self.example_counter, policy_state_dict, metrics, 'policy.pt', output_dir)
+        del policy_state_dict
+        dist.barrier()
+
+        save_policy = FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(self.policy, StateDictType.FULL_STATE_DICT, optim_state_dict_config=save_policy):
+            optimizer_state_dict = FSDP.optim_state_dict(self.policy, self.optimizer)
+
+        if self.rank == 0:
+            self.write_state_dict(self.example_counter, optimizer_state_dict, metrics, 'optimizer.pt', output_dir)
+        del optimizer_state_dict
+        dist.barrier()
+
+        if self.rank == 0:
+            scheduler_state_dict = self.scheduler.state_dict()
+            self.write_state_dict(self.example_counter, scheduler_state_dict, metrics, 'scheduler.pt', output_dir)
+        dist.barrier()
+
+
+class FSDPTrainerXLA(BasicTrainer):
+    def __init__(self, policy: nn.Module, config: DictConfig, seed: int, run_dir: str, reference_model: Optional[nn.Module]):
+        """A trainer subclass that uses PyTorch FSDP to shard the model across multiple XLA devices.
+        
+           This trainer will shard both the policy and reference model across all available XLA devices.
+           Models are sharded at the block level, where the block class name is provided in the config.
+        """
+
+        super().__init__(policy, config, seed, run_dir, reference_model, 0, 1)
+        assert config.model.block_name is not None, 'must specify model.block_name (e.g., GPT2Block or GPTNeoXLayer) for FSDP'
+
+        # Move models to the proper device
+        device = xm.xla_device()
+        policy = policy.to(device)
+        if reference_model:
+            reference_model = reference_model.to(device)
+
+        # Wrap submodules with FSDP too (zero 3)
+        wrap_class = get_block_class_from_model(policy, config.model.block_name)
+        auto_wrap_policy = functools.partial(
+            transformer_auto_wrap_policy, 
+            transformer_layer_cls={wrap_class},
+        )
+
+        # Apply activation checkpointing
+        auto_wrap_callable = None
+        if config.activation_checkpointing:
+            rank0_print("Enabling activation checkpointing")
+            auto_wrap_callable = lambad m, *args, **kwargs: FSDP(
+                checkpoint_module(m), *args, **kwargs
+            )
+
+        # Wrap the base and reference models
+        rank0_print('Sharding policy...')
+        mp_dtype = None
+        if config.model.fsdp_policy_mp is not None:
+            mp_dtype = getattr(torch, config.model.fsdp_policy_mp)
+
+        fsdp_wrap = lambda m: FSDP(
+            m,
+            compute_dtype=mp_dtype,
+            auto_wrap_policy=auto_wrap_policy,
+            auto_wrapper_callable=auto_wrapper_callable
+        )
+        self.policy = fsdp_wrap(policy)
+
+        if config.loss.name == "dpo":
+            rank0_print('Sharding reference model...')
+            self.reference_model = fsdp_wrap(reference_model)
+
+        print('Loaded model on rank', xm.xla_device())
+#        shared_fsdp_kwargs = dict(
+#            auto_wrap_policy=model_auto_wrap_policy,
+#            sharding_strategy=ShardingStrategy.FULL_SHARD,
+#            cpu_offload=CPUOffload(offload_params=False),
+#            backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
+#            device_id=rank,
+#            ignored_modules=None,
+#            limit_all_gathers=False,
+#            use_orig_params=False,
+#            sync_module_states=False
+#        )
+
+    def clip_gradient(self):
+        """Clip the gradient norm of the parameters of an FSDP policy, gathering the gradients across all GPUs."""
+        return self.policy.clip_grad_norm_(self.config.max_grad_norm).item()
+   
+    # TODO: rewrite with fsdp sharded tpu
     def save(self, output_dir=None, metrics=None):
         """Save policy, optimizer, and scheduler state to disk, gathering from all processes and saving only on the rank 0 process."""
         save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)

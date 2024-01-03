@@ -445,6 +445,141 @@ def tokenize_batch_element(prompt: str, chosen: str, rejected: str, truncation_m
     return batch
 
 
+class MapStyleDataset:
+    """
+    Container dataset for XLA map-style dataloader. Probably unnecessary,
+    but might be needed since torch docs say that custom collate functions
+    are recommended for map-style datasets.
+    """
+
+    def __init__(
+        self,
+        names,
+        tokenizer,
+        split,
+        max_length,
+        max_prompt_length,
+        sft_mode,
+        truncation_mode
+    ):
+        self.data = []
+        
+        for name in names:
+            truncation_mode = 'keep_end' if name == 'hh' else 'keep_start'
+            ds = get_dataset(name, split, silent=silent, cache_dir=cache_dir)
+            
+            for prompt, data in ds.items():
+                responses, pairs, sft_target = data["responses"], data["pairs"], data["sft_target"]
+                
+                if sft_mode:
+                    elem = tokenize_batch_element(
+                        prompt,
+                        sft_target,
+                        sft_target,
+                        truncation_mode,
+                        tokenizer,
+                        max_length,
+                        max_prompt_length
+                    )
+                    self.data.append({k: v for k, v in element.items() if 'rejected' not in k})
+                
+                 else:
+                    for p in pairs:
+                        elem = tokenize_batch_element(
+                            prompt,
+                            responses[p[0]],
+                            responses[p[1]],
+                            truncation_mode,
+                            tokenizer,
+                            max_length,
+                            max_prompt_length
+                        )
+                        self.data.append(elem)
+
+    def __getitem__(self, i):
+        return self.data[i]
+
+    def __len__(self):
+        return len(self.data)
+
+
+def xla_get_dataloader(names: List[str],
+                       tokenizer,
+                       device,
+                       split: str = 'train',
+                       batch_size: int = 1,
+                       shuffle: bool = True,
+                       max_length: int = 512,
+                       max_prompt_length: int = 128,
+                       sft_mode: bool = False,
+                       n_epochs: Optional[int] = None,
+                       n_examples: Optional[int] = None,
+                       num_workers: Optional[int] = 4,
+                       seed:int = 0,
+                       silent: bool = False,
+                       cache_dir: Optional[str] = None) -> MapStyleDataset:
+    """
+    Gets torch DataLoader suited for xla ops with DistributedSampler.
+
+    Args:
+        names: Names of datasets to use.
+        tokenizer: Tokenizer to use.
+        device: xla device to use.
+        split: Which split to use.
+        batch_size: Batch size.
+        shuffle: Whether to shuffle the data after each epoch.
+        max_length: Maximum length of the combined prompt + response.
+        max_prompt_length: Maximum length of the prompt.
+        sft_mode: Whether to use SFT mode (i.e., return sft_target instead of chosen/rejected). In sft mode, we just return chosen_input_ids, but they contain the sft_target.
+        n_epochs: Number of epochs to run for. This or n_examples must be specified.
+        n_examples: Number of examples to run for. This or n_epochs must be specified.
+        num_workers: Number of workers for data loading. Default 4.
+        seed: Random seed.
+        silent: Whether to silence the progress bar(s).
+        cache_dir: Directory to cache the datasets in.
+    """
+    
+    # First, construct map-style dataset
+    if n_epochs is not None or n_examples is not None:
+        print("warning: ignoring n_epochs/n_examples in xla dataloader")
+    if silent:
+        datasets.logging.disable_progress_bar()
+        datasets.logging.set_verbosity_error()
+
+    ds = MapStyleDataset(
+        names,
+        tokenizer,
+        split,
+        max_length,
+        max_prompt_length,
+        sft_mode,
+        truncation_mode
+    )
+
+    # Finally, create torch dataloader and move to proper device
+    sampler = None
+    if split == "train" and xm.xrt_world_size() > 1:
+        sampler = torch.utils.data.distributed.DistributedSampler(
+            ds,
+            num_replicas=xm.xrt_world_size(),
+            rank=xm.get_ordinal(),
+            shuffle=shuffle
+        )
+
+    dataloader = torch.utils.data.DataLoader(
+        ds,
+        batch_size=batch_size,
+        sampler=sampler,
+        shuffle=shuffle and sampler is not None,
+        drop_last=False,
+        num_workers=num_workers,
+        collate_fn=get_collate_fn(tokenizer)
+    )
+
+    device_loader = pl.MpDeviceLoader(dataloader, device)
+    return device_loader
+
+
 def get_batch_iterator(names: List[str],
                        tokenizer,
                        split: str = 'train',

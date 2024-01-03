@@ -30,6 +30,7 @@ def worker_sample(rank: int, world_size: int, config: DictConfig, policy: nn.Mod
     print(f'Saved samples on {len(to_save)} eval prompts to {config.sample_path}')
 
 
+# TODO: rewrite for xla tpu and pjrt runtime
 def worker_main(rank: int, world_size: int, config: DictConfig, policy: nn.Module, reference_model: Optional[nn.Module] = None):
     """Main function for each worker process (may be only 1 for BasicTrainer/TensorParallelTrainer)."""
     if 'FSDP' in config.trainer:
