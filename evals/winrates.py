@@ -12,6 +12,12 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 from throttler import submit_jobs
 
+import sys
+sys.path.insert(1, "../eda")
+
+from all_datasets import get_len
+from view_samples import load_samples
+import view_samples
 
 def load_prompt(pfile, pdir):
     """ Loads prompt from file.  """
@@ -31,60 +37,34 @@ def shuffle(d):
     return {key: d[key] for key in k}
 
 
-def load_hh():
+def plot_lengths(sampled, truth, dataset):
     """
-    Loads HH dataset test split.
+    Plot length distribution of all models in sampled vs. truth.
     """
-    dataset = load_dataset("Anthropic/hh-rlhf", split="test")
-    reformatted = {}
-    i = 0
-    kword = "Assistant:"
-    for entry in tqdm(dataset):
-        s = entry["chosen"].rfind(kword) + len(kword)
-        reformatted[entry["chosen"][:s]] = entry["chosen"][s + 1:]
-        i += 1
-    print(f"loaded {i} examples from HH test split")
-    return reformatted
+    flat = []
+    for model in sampled:
+        curr = []
+        for prompt, response in sampled[model].items():
+            length = get_len(response)
+            flat.append(dict(model=model, prompt=prompt, length=length))
+            curr.append(length)
+        print(f"{model}: MEAN {np.mean(curr):.2f} STD {np.std(curr):.2f} MEDIAN {np.median(curr):.2f}")
 
+    curr = []
+    for prompt, response in truth.items():
+        length = get_len(response)
+        flat.append(dict(model="truth", prompt=prompt, length=length))
+        curr.append(length)
+    print(f"truth: MEAN {np.mean(curr):.2f} STD {np.std(curr):.2f} MEDIAN {np.median(curr):.2f}")
 
-def load_shp():
-    """
-    Loads SHP dataset test split.
-    """
-    dataset = load_dataset("stanfordnlp/SHP", split="test")
-    reformatted = {}
-    i = 0
-    for entry in tqdm(dataset):
-        key = "A" if int(entry["labels"]) == 0 else "B"
-        prompt = f"\n\nHuman: {entry['history']}\n\nAssistant:"
-        reformatted[prompt] = entry[f"human_ref_{key}"]
-        i += 1
-    print(f"loaded {i} examples from SHP test split")
-    return reformatted
+    flat = pd.DataFrame(flat)
 
-
-def load_samples(sample_dir, to_process=None):
-    """
-    Get samples from directory and list of json files.
-    Returns a dict with keys corresponding to model names, and values
-    corresponding to dict of prompt: response pairs.
-    """
-    if to_process is None:
-        to_process = os.listdir(sample_dir)
-
-    sampled = defaultdict(dict)
-    kword = "Assistant:"
-    for f in to_process:
-        if f.endswith(".json"):
-            with open(os.path.join(sample_dir, f), "r") as fi:
-                tmp = json.load(fi)
-                for prompt, v in tmp.items():
-                    v = v[0]
-                    response = v[v.rfind(kword) + len(kword) + 1:]
-                    sampled[f.replace(".json", "")][prompt] = response
-
-    print(f"loaded samples from {len(to_process)} models")
-    return sampled
+    sns.displot(flat, x="length", hue="model", kind="kde", fill=True)
+    plt.title(f"{dataset.upper()}: Length distribution of sampled models vs. truth")
+    plt.xlabel("Length (tokens)")
+    plt.ylabel("Density")
+    plt.tight_layout()
+    plt.savefig(f"{dataset.lower()}_lengths.png", dpi=200, bbox_inches='tight')
 
 
 def batch_judge(batch, system, template, key, model_wins, cache_file, gpt_model, seed=None, use_lab_key=False):
@@ -103,7 +83,6 @@ def batch_judge(batch, system, template, key, model_wins, cache_file, gpt_model,
         )
         for a, b, prompt, model in batch
     ]
-
 
     api_key = os.getenv("OPENAI_API_KEY")
     if use_lab_key:
@@ -168,7 +147,7 @@ def winrates(
     return model_wins
 
 
-def analyze(model_wins):
+def plot_winrates(model_wins):
     """
     Analyzes winrates.
     """
@@ -310,11 +289,13 @@ if __name__ == "__main__":
     brevity = load_prompt("brevity.prompt", args.prompt_dir)
     system = load_prompt("system.prompt", args.prompt_dir)
 
-    sampled = load_samples(args.sample_dir, args.sample_files)
-    truth = locals()[f"load_{args.dataset}"]()
+    truth = getattr(view_samples, f"load_{args.dataset}")()
     truth = shuffle(truth)
 
-    analyze(
+    sampled = load_samples(args.sample_dir, args.sample_files)
+    plot_lengths(sampled, truth, args.dataset)
+
+    plot_winrates(
         winrates(
             truth,
             sampled,
