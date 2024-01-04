@@ -2,6 +2,7 @@ import torch
 torch.backends.cuda.matmul.allow_tf32 = True
 import torch.nn as nn
 import transformers
+import utils
 from utils import get_local_dir, get_local_run_dir, disable_dropout, init_distributed, get_open_port, USING_XLA
 import os
 import hydra
@@ -74,11 +75,16 @@ def main(config: DictConfig):
     if missing_keys:
         raise ValueError(f"Got missing keys in config:\n{missing_keys}")
     
-    global USING_XLA
-    USING_XLA = config.use_tpu
+    utils.USING_XLA = config.use_tpu
     print("NOTE: USING_XLA:", USING_XLA)
     if USING_XLA:
         print("NOTE: FSDP implementation differs on TPU vs GPU; using XLA implementation")
+
+    try:
+        utils.GCP_BUCKET = config.gcp_bucket
+        print(f"NOTE: using GCP bucket {config.gcp_bucket}")
+    except:
+        print("NOTE: no GCP bucket provided")
 
     if config.eval_every % config.batch_size != 0:
         print('WARNING: eval_every must be divisible by batch_size')

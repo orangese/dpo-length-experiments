@@ -1,5 +1,6 @@
 import os
 import getpass
+import subprocess
 from datetime import datetime
 import torch
 import random
@@ -8,9 +9,10 @@ import torch.distributed as dist
 import inspect
 import importlib.util
 import socket
-import os
+import gcsfs
 from typing import Dict, Union, Type, List
 
+GCP_BUCKET = None
 USING_XLA = False
 try:
     import torch_xla.core.xla_model as xm
@@ -24,23 +26,14 @@ def get_open_port():
         return s.getsockname()[1] # return only the port number
 
 
-def get_remote_file(remote_path, local_path=None):
-    hostname, path = remote_path.split(':')
-    local_hostname = socket.gethostname()
-    if hostname == local_hostname or hostname == local_hostname[:local_hostname.find('.')]:
-        return path
-    
-    if local_path is None:
-        local_path = path
-    # local_path = local_path.replace('/scr-ssd', '/scr')    
-    if os.path.exists(local_path):
-        return local_path
-    local_dir = os.path.dirname(local_path)
-    os.makedirs(local_dir, exist_ok=True)
-
-    print(f'Copying {hostname}:{path} to {local_path}')
-    os.system(f'scp {remote_path} {local_path}')
-    return local_path
+def get_gcp_project():
+    """Gets current gcp project."""
+    command = "gcloud config get-value project".split()
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode == 0:
+        return result.stdout.strip()
+    else:
+        raise ValueError(f"gcloud failed: {result.stderr}")
 
 
 def rank0_print(*args, **kwargs):

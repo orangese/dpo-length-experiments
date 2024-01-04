@@ -1,9 +1,10 @@
 import re
 import datasets
+import gcsfs
 import os
 import json
 import torch
-from utils import TemporarilySeededRandom
+from utils import TemporarilySeededRandom, get_gcp_project, GCP_BUCKET
 from torch.nn.utils.rnn import pad_sequence
 from collections import defaultdict
 import tqdm
@@ -50,13 +51,39 @@ def strip_html_tags(html_string):
     return text
 
 
+def load_dataset(hf_code, split=None, cache_dir=None, bucket=GCP_BUCKET):
+    """
+    Loads dataset given huggingface code, either locally or on GCP.
+    If loading with GCP, saves the dataset in GCP for usage later (caching
+    is still done locally since HF only supports local filesystem caches).
+    """
+    if not bucket:
+        return datasets.load_dataset(hf_code, cache_dir=cache_dir, split=split)
+
+    assert bucket, "bucket must be provided for gcp loading"
+    storage_options = dict(project=get_gcp_project())
+    fs = gcsfs.GCSFileSystem(**storage_options)
+
+    output_dir = "gs://" + os.path.join(bucket, "datasets", hf_code)
+    if not fs.exists(output_dir):
+        print(f"downloading and preparing {hf_code} to gcp location '{output_dir}'")
+        ds = datasets.load_dataset(hf_code, cache_dir=cache_dir, split=split)
+        ds.save_to_disk(output_dir)
+
+    print(f"loading {hf_code} from gcp location '{output_dir}'")
+    ds = datasets.load_from_disk(output_dir, storage_options=storage_options)
+    if split is None:
+        return ds
+    return ds[split]
+
+
 def get_se(split, silent=False, cache_dir: str = None) -> Dict[str, Dict[str, Union[List[Tuple[int, int]], List[str], str]]]:
     """Load the StackExchange dataset from Huggingface, and return a dict of prompts and responses. See get_hh for the format.
     
        We strip the HTML tags from the responses (except for <code> tags), and we add necessary newlines.
     """
     print(f'Loading SE dataset ({split} split) from Huggingface...')
-    dataset = datasets.load_dataset('HuggingFaceH4/stack-exchange-preferences', cache_dir=cache_dir)['train']
+    dataset = load_dataset('HuggingFaceH4/stack-exchange-preferences', cache_dir=cache_dir)['train']
     print('done')
 
     # shuffle the dataset and select 1% for test
@@ -96,7 +123,7 @@ def get_shp(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str
        For this dataset, the sft_target is the response with the highest score.
     """
     print(f'Loading SHP dataset ({split} split) from Huggingface...')
-    dataset = datasets.load_dataset('stanfordnlp/SHP', split=split, cache_dir=cache_dir)
+    dataset = load_dataset('stanfordnlp/SHP', split=split, cache_dir=cache_dir)
     print('done')
 
     data = defaultdict(lambda: defaultdict(list))
@@ -126,7 +153,7 @@ def get_shp(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str
 
 def get_webgpt(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str, Dict[str, Union[List[Tuple[int, int]], List[str], str]]]:
     print(f'Loading WebGPT dataset ({split}) from Huggingface...')
-    dataset = datasets.load_dataset("openai/webgpt_comparisons", split=split, cache_dir=cache_dir)
+    dataset = load_dataset("openai/webgpt_comparisons", split=split, cache_dir=cache_dir)
     print('done')
 
     def split_prompt_and_responses(row):
@@ -156,7 +183,7 @@ def get_rlcd(split: str, silent: bool = False, cache_dir: str = None) -> Dict[st
         # only "train", "validation" available
 
     print(f'Loading RLCD dataset ({split}) from Huggingface...')
-    dataset = datasets.load_dataset("TaylorAI/RLCD-generated-preference-data-split", split=split, cache_dir=cache_dir)
+    dataset = load_dataset("TaylorAI/RLCD-generated-preference-data-split", split=split, cache_dir=cache_dir)
     print('done', len(dataset))
 
     def split_prompt_and_responses(row):
@@ -206,7 +233,7 @@ def get_alpaca(split: str, silent: bool = False, cache_dir: str = None) -> Dict[
 
 def get_stack(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str, Dict[str, Union[List[Tuple[int, int]], List[str], str]]]:
     print(f'Loading SE stack dataset (split={split}) from huggingface...')
-    dataset = datasets.load_dataset("lvwerra/stack-exchange-paired", split=split, cache_dir=cache_dir)
+    dataset = load_dataset("lvwerra/stack-exchange-paired", split=split, cache_dir=cache_dir)
     dataset = dataset.select(range(100000))  # see https://github.com/huggingface/trl
     print('done')
 
@@ -297,7 +324,7 @@ def get_hh(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str,
        For this dataset, the sft_target is just the chosen response.
     """
     print(f'Loading HH dataset ({split} split) from Huggingface...')
-    dataset = datasets.load_dataset('Anthropic/hh-rlhf', split=split, cache_dir=cache_dir)
+    dataset = load_dataset('Anthropic/hh-rlhf', split=split, cache_dir=cache_dir)
     print('done')
 
     def split_prompt_and_responses(ex):
