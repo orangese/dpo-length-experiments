@@ -18,6 +18,8 @@ tokenizer = transformers.AutoTokenizer.from_pretrained(
 def get_len(text, tokenizer=tokenizer, cache=None):
     if cache is None:
         cache = {}
+    if text is None:
+        return 0
     try:
         toklen = cache[text]
     except KeyError:
