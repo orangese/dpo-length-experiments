@@ -11,8 +11,11 @@ import random
 from bs4 import BeautifulSoup, NavigableString
 import numpy as np
 from typing import Dict, List, Optional, Iterator, Callable, Union, Tuple
-import torch_xla.core.xla_model as xm
-import torch_xla.distributed.parallel_loader as pl
+try:
+    import torch_xla.core.xla_model as xm
+    import torch_xla.distributed.parallel_loader as pl
+except (ModuleNotFoundError, ImportError):
+    print("WARNING: torch_xla not found")
 
 
 def extract_anthropic_prompt(prompt_and_response):

@@ -19,13 +19,16 @@ from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 import tensor_parallel as tp
 import contextlib
 
-import torch_xla.core.xla_model as xm
-from torch_xla.distributed.fsdp import (
-    XlaFullyShardedDataParallel as FSDP,
-    consolidate_sharded_model_checkpoints,
-    checkpoint_module,
-)
-from torch_xla.distributed.fsdp.wrap import transformer_auto_wrap_policy
+try:
+    import torch_xla.core.xla_model as xm
+    from torch_xla.distributed.fsdp import (
+        XlaFullyShardedDataParallel as FSDP,
+        consolidate_sharded_model_checkpoints,
+        checkpoint_module,
+    )
+    from torch_xla.distributed.fsdp.wrap import transformer_auto_wrap_policy
+except (ModuleNotFoundError, ImportError):
+    print("WARNING: torch_xla not found")
 
 from preference_datasets import get_batch_iterator, xla_get_dataloader
 from utils import (

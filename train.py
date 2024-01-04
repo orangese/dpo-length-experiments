@@ -6,8 +6,6 @@ from utils import get_local_dir, get_local_run_dir, disable_dropout, init_distri
 import os
 import hydra
 import torch.multiprocessing as mp
-import torch_xla.distributed.xla_multiprocessing as xmp
-import torch_xla.core.xla_model as xm
 from omegaconf import OmegaConf, DictConfig
 import trainers
 import wandb
@@ -15,6 +13,12 @@ import json
 import socket
 from typing import Optional, Set
 import resource
+
+try:
+    import torch_xla.distributed.xla_multiprocessing as xmp
+    import torch_xla.core.xla_model as xm
+except (ModuleNotFoundError, ImportError):
+    print("WARNING: torch_xla not found")
 
 
 OmegaConf.register_new_resolver("get_local_run_dir", lambda exp_name, local_dirs: get_local_run_dir(exp_name, local_dirs))

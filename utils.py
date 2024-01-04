@@ -5,7 +5,6 @@ import torch
 import random
 import numpy as np
 import torch.distributed as dist
-import torch_xla.core.xla_model as xm
 import inspect
 import importlib.util
 import socket
@@ -13,6 +12,10 @@ import os
 from typing import Dict, Union, Type, List
 
 USING_XLA = False
+try:
+    import torch_xla.core.xla_model as xm
+except (ModuleNotFoundError, ImportError):
+    print("WARNING: torch_xla not found")
 
 
 def get_open_port():
