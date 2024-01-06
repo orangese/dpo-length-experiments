@@ -124,9 +124,15 @@ def main(config: DictConfig):
         reference_model = None
 
     if config.model.archive is not None:
-        state_dict = torch.load(config.model.archive, map_location='cpu')
+        if utils.GCP_BUCKET is not None:
+            archive_path = config.model.archive.replace(os.path.join(utils.GCP_BUCKET, "runs"), get_local_dir(config.local_dirs))
+            print(f'downloading pre-trained weights from {config.model.archive} to {archive_path}')
+            utils.download_from_gcp(config.model.archive, archive_path)
+        else:
+            archive_path = config.model.archive
+        state_dict = torch.load(archive_path, map_location='cpu')
         step, metrics = state_dict['step_idx'], state_dict['metrics']
-        print(f'loading pre-trained weights at step {step} from {config.model.archive} with metrics {json.dumps(metrics, indent=2)}')
+        print(f'loading pre-trained weights at step {step} from {archive_path} with metrics {json.dumps(metrics, indent=2)}')
         policy.load_state_dict(state_dict['state'])
         if config.loss.name == 'dpo' and not config.sample_only:
             reference_model.load_state_dict(state_dict['state'])
@@ -144,12 +150,12 @@ def main(config: DictConfig):
         print(f'setting RLIMIT_NOFILE soft limit to {hard} from {soft}')
     
         if USING_XLA:
-            print(f'starting {xm.xrt_world_size()} processes for FSDP training')
+            print(f'XLA: starting {xm.xrt_world_size()} processes for FSDP training')
             xmp.spawn(worker_main, args=(1, config, policy, reference_model), nprocs=xm.xrt_world_size())
 
         else:
             world_size = torch.cuda.device_count()
-            print('starting', world_size, 'processes for FSDP training')
+            print('GPU: starting', world_size, 'processes for FSDP training')
             mp.spawn(worker_main, nprocs=world_size, args=(world_size, config, policy, reference_model), join=True)
 
     else:

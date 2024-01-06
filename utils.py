@@ -42,7 +42,17 @@ def upload_to_gcp(local_path: str, gcp_path: str):
     if result.returncode == 0:
         return result.stdout.strip()
     else:
-        raise ValueError(f"gsutil failed: {result.stderr}")
+        raise ValueError(f"gsutil upload failed: {result.stderr}")
+
+
+def download_from_gcp(gcp_path: str, local_path: str):
+    """Downloads a file from gcp."""
+    command = f"gsutil cp {gcp_path} {local_path}".split()
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode == 0:
+        return result.stdout.strip()
+    else:
+        raise ValueError(f"gsutil download failed: {result.stderr}")
 
 
 def rank0_print(*args, **kwargs):
