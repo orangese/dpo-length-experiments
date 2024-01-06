@@ -39,7 +39,9 @@ from utils import (
     get_block_class_from_model,
     rank0_print,
     get_local_dir,
-    USING_XLA
+    upload_to_gcp,
+    USING_XLA,
+    GCP_BUCKET,
 )
 import numpy as np
 import wandb
@@ -170,8 +172,8 @@ class BasicTrainer(object):
         self.world_size = world_size
         self.config = config
         self.run_dir = run_dir
-        if USING_XLA:
-            assert not self.config.sample_during_eval, "sampling during training not supported with xla"
+        if USING_XLA or GCP_BUCKET:
+            assert not self.config.sample_during_eval, "sampling during training not supported with xla/gcp"
 
         tokenizer_name_or_path = config.model.tokenizer_name_or_path or config.model.name_or_path
         rank0_print(f'Loading tokenizer {tokenizer_name_or_path}')
@@ -497,11 +499,16 @@ class BasicTrainer(object):
         os.makedirs(dir_name, exist_ok=True)
         output_path = os.path.join(dir_name, filename)
         rank0_print(f'writing checkpoint to {output_path}...')
-        torch.save({
+
+        data = {
             'step_idx': step,
             'state': state,
             'metrics': metrics if metrics is not None else {},
-        }, output_path)
+        }
+        if USING_XLA:
+            xm.save(data, output_path, master_only=True)
+        else:
+            torch.save(data, output_path)
 
     def save(self, output_dir: Optional[str] = None, metrics: Optional[Dict] = None):
         """Save policy, optimizer, and scheduler state to disk."""
@@ -765,9 +772,9 @@ class FSDPTrainerXLA(BasicTrainer):
         return last_log
     
     def clip_gradient(self):
-        """Clip the gradient norm of the parameters of an FSDP policy, gathering the gradients across all GPUs."""
+        """Clip the gradient norm of the parameters of an FSDP policy, gathering the gradients across all XLA devices."""
         return self.policy.clip_grad_norm_(self.config.max_grad_norm).item()
-    
+
     def save(self, output_dir=None, metrics=None):
         """Save policy, optimizer, and scheduler state to disk."""
         # Save model checkpoint
@@ -779,9 +786,6 @@ class FSDPTrainerXLA(BasicTrainer):
         ckpt = {
             'model': self.policy.state_dict(),
             'shard_metadata': self.policy.get_shard_metadata(),
-            'optimizer': self.optimizer.state_dict(),  # not needed in ckpt consolidation
-            'step_idx': self.example_counter,  # not needed in ckpt consolidation
-            'metrics': metrics if metrics is not None else {},  # not needed in ckpt consolidation
         }
         os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
         xm.save(ckpt, ckpt_path, master_only=False)
@@ -794,9 +798,46 @@ class FSDPTrainerXLA(BasicTrainer):
                 ckpt_suffix="_rank-*-of-*.pth"
             )
             rank0_print(f'consolidated checkpoint saved to {ckpt_prefix}_consolidated.pth\n', end='')
+        
         xm.rendezvous('ckpt_consolidation')
- 
 
+        # Fix formats and upload to GCP on master process
+        if xm.is_master_ordinal(local=False):
+            self.coerce_ckpt_format(ckpt_prefix, metrics, output_dir)
+    
+    def coerce_ckpt_format(self, ckpt_prefix, metrics, output_dir):
+        # format consolidated checkpoint to match original format
+        ckpt = torch.load(f"{ckpt_prefix}_consolidated.pth", map_location="cpu")
+        self.write_state_dict(self.example_counter, ckpt["model"], metrics, 'policy.pt', output_dir)
+        del ckpt
+    
+        # remove the sharded checkpoints and consolidated checkpoint
+        world_size = xm.xrt_world_size()
+        for rank in range(world_size):
+            os.remove(f'{ckpt_prefix}_rank-{rank:08d}-of-{world_size:08d}.pth')
+        os.remove(f'{ckpt_prefix}_consolidated.pth')
+        rank0_print(f'removed local shards and consolidated checkpoint\n', end='')
+
+        # save optimizer and scheduler state
+        optimizer_state_dict = self.optimizer.state_dict()
+        self.write_state_dict(self.example_counter, optimizer_state_dict, metrics, 'optimizer.pt', output_dir)
+        del optimizer_state_dict
+
+        scheduler_state_dict = self.scheduler.state_dict()
+        self.write_state_dict(self.example_counter, scheduler_state_dict, metrics, 'scheduler.pt', output_dir)
+        del scheduler_state_dict
+
+        # upload to gcp if available
+        if self.config.gcp_bucket is not None:
+            paths = [os.path.join(output_dir, f) for f in ["policy.pt", "optimizer.pt", "scheduler.pt"]]
+            cache_dir = get_local_dir(self.config.local_dirs)
+            save_dir = output_dir.replace(cache_dir, os.path.join(self.config.gcp_bucket, "runs"))
+            for path in paths:
+                upload_to_gcp(path, os.path.join(save_dir, os.path.basename(path)))
+                os.remove(path)
+            rank0_print(f'uploaded consolidated checkpoints to gcp\n', end='')
+
+ 
 class TensorParallelTrainer(BasicTrainer):
     def __init__(self, policy, config, seed, run_dir, reference_model=None, rank=0, world_size=1):
         """A trainer subclass that uses TensorParallel to shard the model across multiple GPUs.

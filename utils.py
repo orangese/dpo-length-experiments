@@ -9,7 +9,6 @@ import torch.distributed as dist
 import inspect
 import importlib.util
 import socket
-import gcsfs
 from typing import Dict, Union, Type, List
 
 GCP_BUCKET = None
@@ -34,6 +33,16 @@ def get_gcp_project():
         return result.stdout.strip()
     else:
         raise ValueError(f"gcloud failed: {result.stderr}")
+
+
+def upload_to_gcp(local_path: str, gcp_path: str):
+    """Uploads a file to gcp."""
+    command = f"gsutil cp {local_path} {gcp_path}".split()
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode == 0:
+        return result.stdout.strip()
+    else:
+        raise ValueError(f"gsutil failed: {result.stderr}")
 
 
 def rank0_print(*args, **kwargs):
