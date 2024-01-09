@@ -6,17 +6,19 @@ import json
 import torch
 from utils import TemporarilySeededRandom, get_gcp_project, GCP_BUCKET
 from torch.nn.utils.rnn import pad_sequence
+from functools import partial
 from collections import defaultdict
 import tqdm
 import random
 from bs4 import BeautifulSoup, NavigableString
 import numpy as np
 from typing import Dict, List, Optional, Iterator, Callable, Union, Tuple
+from utils import rank0_print
 try:
     import torch_xla.core.xla_model as xm
     import torch_xla.distributed.parallel_loader as pl
 except (ModuleNotFoundError, ImportError):
-    print("WARNING: torch_xla not found")
+    rank0_print("WARNING: torch_xla not found")
 
 
 def extract_anthropic_prompt(prompt_and_response):
@@ -66,11 +68,11 @@ def load_dataset(hf_code, split=None, cache_dir=None, bucket=GCP_BUCKET):
 
     output_dir = "gs://" + os.path.join(bucket, "datasets", hf_code)
     if not fs.exists(output_dir):
-        print(f"downloading and preparing {hf_code} to gcp location '{output_dir}'")
+        rank0_print(f"downloading and preparing {hf_code} to gcp location '{output_dir}'")
         ds = datasets.load_dataset(hf_code, cache_dir=cache_dir, split=split)
         ds.save_to_disk(output_dir)
 
-    print(f"loading {hf_code} from gcp location '{output_dir}'")
+    rank0_print(f"loading {hf_code} from gcp location '{output_dir}'")
     ds = datasets.load_from_disk(output_dir, storage_options=storage_options)
     if split is None:
         return ds
@@ -82,9 +84,9 @@ def get_se(split, silent=False, cache_dir: str = None) -> Dict[str, Dict[str, Un
     
        We strip the HTML tags from the responses (except for <code> tags), and we add necessary newlines.
     """
-    print(f'Loading SE dataset ({split} split) from Huggingface...')
+    rank0_print(f'Loading SE dataset ({split} split) from Huggingface...')
     dataset = load_dataset('HuggingFaceH4/stack-exchange-preferences', cache_dir=cache_dir)['train']
-    print('done')
+    rank0_print('done')
 
     # shuffle the dataset and select 1% for test
     dataset = dataset.shuffle(seed=42)
@@ -122,9 +124,9 @@ def get_shp(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str
        We filter preference pairs to only keep pairs where the score ratio is at least 2.
        For this dataset, the sft_target is the response with the highest score.
     """
-    print(f'Loading SHP dataset ({split} split) from Huggingface...')
+    rank0_print(f'Loading SHP dataset ({split} split) from Huggingface...')
     dataset = load_dataset('stanfordnlp/SHP', split=split, cache_dir=cache_dir)
-    print('done')
+    rank0_print('done')
 
     data = defaultdict(lambda: defaultdict(list))
     for row in tqdm.tqdm(dataset, desc='Processing SHP', disable=silent):
@@ -152,9 +154,9 @@ def get_shp(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str
 
 
 def get_webgpt(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str, Dict[str, Union[List[Tuple[int, int]], List[str], str]]]:
-    print(f'Loading WebGPT dataset ({split}) from Huggingface...')
+    rank0_print(f'Loading WebGPT dataset ({split}) from Huggingface...')
     dataset = load_dataset("openai/webgpt_comparisons", split=split, cache_dir=cache_dir)
-    print('done')
+    rank0_print('done')
 
     def split_prompt_and_responses(row):
         prompt = row["question"]["full_text"]
@@ -182,9 +184,9 @@ def get_rlcd(split: str, silent: bool = False, cache_dir: str = None) -> Dict[st
         split = "validation"
         # only "train", "validation" available
 
-    print(f'Loading RLCD dataset ({split}) from Huggingface...')
+    rank0_print(f'Loading RLCD dataset ({split}) from Huggingface...')
     dataset = load_dataset("TaylorAI/RLCD-generated-preference-data-split", split=split, cache_dir=cache_dir)
-    print('done', len(dataset))
+    rank0_print('done', len(dataset))
 
     def split_prompt_and_responses(row):
         prompt = (row["instruction"] or "") + (row["input"] or "")
@@ -207,10 +209,10 @@ def get_rlcd(split: str, silent: bool = False, cache_dir: str = None) -> Dict[st
 
 def get_alpaca(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str, Dict[str, Union[List[Tuple[int, int]], List[str], str]]]:
     """Load the AlpacaFarm dataset."""
-    print(f'Loading AlpacaFarm dataset (split=all, ignoring arg) locally...')
+    rank0_print(f'Loading AlpacaFarm dataset (split=all, ignoring arg) locally...')
     with open(os.path.join("data/farm/alpaca_human_preference.json"), 'r') as f:
         dataset = json.load(f)
-    print('done')
+    rank0_print('done')
 
     def split_prompt_and_responses(row):
         prompt = row["instruction"] + row["input"]
@@ -232,10 +234,10 @@ def get_alpaca(split: str, silent: bool = False, cache_dir: str = None) -> Dict[
 
 
 def get_stack(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str, Dict[str, Union[List[Tuple[int, int]], List[str], str]]]:
-    print(f'Loading SE stack dataset (split={split}) from huggingface...')
+    rank0_print(f'Loading SE stack dataset (split={split}) from huggingface...')
     dataset = load_dataset("lvwerra/stack-exchange-paired", split=split, cache_dir=cache_dir)
     dataset = dataset.select(range(100000))  # see https://github.com/huggingface/trl
-    print('done')
+    rank0_print('done')
 
     def split_prompt_and_responses(row):
         prompt = row["question"]
@@ -257,7 +259,7 @@ def get_stack(split: str, silent: bool = False, cache_dir: str = None) -> Dict[s
 def load_tldr(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str, Dict[str, Union[List[Tuple[int, int]], List[str], str]]]:
     datapath = "data/tldr/comparisons"
 
-    print(f"Loading TLDR dataset from {datapath} with '{split}' split, locally...")
+    rank0_print(f"Loading TLDR dataset from {datapath} with '{split}' split, locally...")
     tldr = []
     train_re = r"batch([3-9]|10)\.json"
 
@@ -283,7 +285,7 @@ def load_tldr(split: str, silent: bool = False, cache_dir: str = None) -> Dict[s
                     "chosen": y1 if sample["choice"] == 0 else y2,
                     "rejected": y2 if sample["choice"] == 0 else y1
                 })
-    print("done")
+    rank0_print("done")
 
     def split_prompt_and_responses(row):
         prompt = row["prompt"]
@@ -323,9 +325,9 @@ def get_hh(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str,
        
        For this dataset, the sft_target is just the chosen response.
     """
-    print(f'Loading HH dataset ({split} split) from Huggingface...')
+    rank0_print(f'Loading HH dataset ({split} split) from Huggingface...')
     dataset = load_dataset('Anthropic/hh-rlhf', split=split, cache_dir=cache_dir)
-    print('done')
+    rank0_print('done')
 
     def split_prompt_and_responses(ex):
         prompt = extract_anthropic_prompt(ex['chosen'])
@@ -372,40 +374,36 @@ def get_dataset(name: str, split: str, silent: bool = False, cache_dir: str = No
     return data
 
 
-def get_collate_fn(tokenizer) -> Callable[[List[Dict]], Dict[str, Union[List, torch.Tensor]]]:
-    """Returns a collate function for the given tokenizer.
-    
-       The collate function takes a list of examples (dicts, where values are lists of
-         ints [tokens] or strings [the original texts]) and returns a batch of examples,
-         PyTorch tensors padded to the maximum length. Strings are passed through."""
-    def collate_fn(batch):
-        # first, pad everything to the same length
-        padded_batch = {}
-        for k in batch[0].keys():
-            if k.endswith('_input_ids') or k.endswith('_attention_mask') or k.endswith('_labels'):
-                if 'prompt' in k:  # adapted from https://stackoverflow.com/questions/73256206
-                    to_pad = [torch.LongTensor(ex[k][::-1]) for ex in batch]
-                else:
-                    to_pad = [torch.LongTensor(ex[k]) for ex in batch]
-                if k.endswith('_input_ids'):
-                    padding_value = tokenizer.pad_token_id
-                elif k.endswith('_labels'):
-                    padding_value = -100
-                elif k.endswith('_attention_mask'):
-                    padding_value = 0
-                else:
-                    raise ValueError(f"Unexpected key in batch '{k}'")
-
-                padded_batch[k] = pad_sequence(to_pad, batch_first=True, padding_value=padding_value)
-                if 'prompt' in k:  # for the prompt, flip back so padding is on left side
-                    padded_batch[k] = padded_batch[k].flip(dims=[1])
-            elif k.endswith("_len"):
-                padded_batch[k] = torch.LongTensor([ex[k] for ex in batch])
+def _collate_fn(batch, tokenizer) -> Dict[str, Union[List, torch.Tensor]]:
+    """The collate function takes a list of examples (dicts, where values are lists of
+    ints [tokens] or strings [the original texts]) and returns a batch of examples,
+    PyTorch tensors padded to the maximum length. Strings are passed through."""
+    # first, pad everything to the same length
+    padded_batch = {}
+    for k in batch[0].keys():
+        if k.endswith('_input_ids') or k.endswith('_attention_mask') or k.endswith('_labels'):
+            if 'prompt' in k:  # adapted from https://stackoverflow.com/questions/73256206
+                to_pad = [torch.LongTensor(ex[k][::-1]) for ex in batch]
             else:
-                padded_batch[k] = [ex[k] for ex in batch]
+                to_pad = [torch.LongTensor(ex[k]) for ex in batch]
+            if k.endswith('_input_ids'):
+                padding_value = tokenizer.pad_token_id
+            elif k.endswith('_labels'):
+                padding_value = -100
+            elif k.endswith('_attention_mask'):
+                padding_value = 0
+            else:
+                raise ValueError(f"Unexpected key in batch '{k}'")
 
-        return padded_batch
-    return collate_fn
+            padded_batch[k] = pad_sequence(to_pad, batch_first=True, padding_value=padding_value)
+            if 'prompt' in k:  # for the prompt, flip back so padding is on left side
+                padded_batch[k] = padded_batch[k].flip(dims=[1])
+        elif k.endswith("_len"):
+            padded_batch[k] = torch.LongTensor([ex[k] for ex in batch])
+        else:
+            padded_batch[k] = [ex[k] for ex in batch]
+
+    return padded_batch
 
 
 def tokenize_batch_element(prompt: str, chosen: str, rejected: str, truncation_mode: str, tokenizer, max_length: int, max_prompt_length: int) -> Dict:
@@ -573,12 +571,12 @@ def xla_get_dataloader(names: List[str],
     
     # First, construct map-style dataset
     if n_epochs is not None or n_examples is not None:
-        print("warning: ignoring n_epochs/n_examples in xla dataloader")
+        rank0_print("warning: ignoring n_epochs/n_examples in xla dataloader")
     if silent:
         datasets.logging.disable_progress_bar()
         datasets.logging.set_verbosity_error()
 
-    xm.master_print("using XLA dataloader")
+    rank0_print("using XLA dataloader")
     ds = MapStyleDataset(
         names,
         tokenizer,
@@ -605,10 +603,10 @@ def xla_get_dataloader(names: List[str],
         ds,
         batch_size=batch_size,
         sampler=sampler,
-        shuffle=shuffle and sampler is not None,
+        shuffle=shuffle and sampler is None,
         drop_last=False,
         num_workers=num_workers,
-        collate_fn=get_collate_fn(tokenizer)
+        collate_fn=partial(_collate_fn, tokenizer=tokenizer)
     )
 
     device_loader = pl.MpDeviceLoader(dataloader, device)
@@ -658,15 +656,14 @@ def get_batch_iterator(names: List[str],
             for prompt, data in get_dataset(name, split, silent=silent, cache_dir=cache_dir).items():
                 flat_data.append((prompt, data['responses'], data['pairs'], data['sft_target'], truncation_mode))
 
-    collate_fn = get_collate_fn(tokenizer)
-
     epoch_idx = 0
     example_idx = 0
     done = False
+    collate_fn = partial(_collate_fn, tokenizer=tokenizer)
     while True:
         if n_epochs is not None and epoch_idx >= n_epochs:
             if not silent:
-                print(f'Finished generating {n_epochs} epochs on {split} split')
+                rank0_print(f'Finished generating {n_epochs} epochs on {split} split')
             break
         if shuffle:
             with TemporarilySeededRandom(next(permutation_seeds)):
@@ -685,7 +682,7 @@ def get_batch_iterator(names: List[str],
                     yield collate_fn(batch)
                     if n_examples is not None and example_idx >= n_examples:
                         if not silent:
-                            print(f'Finished generating {n_examples} examples on {split} split')
+                            rank0_print(f'Finished generating {n_examples} examples on {split} split')
                         done = True
 
                     batch = []
@@ -700,7 +697,7 @@ def get_batch_iterator(names: List[str],
                         yield collate_fn(batch)
                         if n_examples is not None and example_idx >= n_examples:
                             if not silent:
-                                print(f'FINISHED {n_examples} EXAMPLES on {split} split')
+                                rank0_print(f'FINISHED {n_examples} EXAMPLES on {split} split')
                             done = True
                         batch = []
         if done:

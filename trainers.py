@@ -192,18 +192,25 @@ class BasicTrainer(object):
         self.reference_model = reference_model
         
         dataloader_fn = get_batch_iterator
+        data_iterator_kwargs["silent"] = rank != 0
+        data_iterator_kwargs["n_epochs"] = config.n_epochs
+        data_iterator_kwargs["n_examples"] = config.n_examples
+
         if config.use_tpu:
             dataloader_fn = xla_get_dataloader
             data_iterator_kwargs["device"] = xm.xla_device()
+            data_iterator_kwargs["silent"] = not xm.is_master_ordinal(local=False)
+            del data_iterator_kwargs["n_epochs"]
+            del data_iterator_kwargs["n_examples"]
 
         if not no_train:
-            self.train_iterator = dataloader_fn(**data_iterator_kwargs, split='train', n_epochs=config.n_epochs, n_examples=config.n_examples, batch_size=config.batch_size, silent=rank != 0, cache_dir=get_local_dir(config.local_dirs))
+            self.train_iterator = dataloader_fn(**data_iterator_kwargs, split='train', batch_size=config.batch_size, cache_dir=get_local_dir(config.local_dirs))
             rank0_print(f'Loaded train data iterator ({config.use_tpu=})')
         else:
             self.train_iterator = None
             rank0_print('Did not load train data iterator')
 
-        self.eval_iterator = get_batch_iterator(**data_iterator_kwargs, split='test', n_examples=config.n_eval_examples, batch_size=config.eval_batch_size, silent=rank != 0, cache_dir=get_local_dir(config.local_dirs))
+        self.eval_iterator = dataloader_fn(**data_iterator_kwargs, split='test', batch_size=config.eval_batch_size, cache_dir=get_local_dir(config.local_dirs))
         if not config.use_tpu:
             self.eval_batches = None
             rank0_print(f'Loaded {len(self.eval_batches)} eval batches of size {config.eval_batch_size}')
@@ -617,7 +624,8 @@ class FSDPTrainer(BasicTrainer):
 
 
 class FSDPTrainerXLA(BasicTrainer):
-    def __init__(self, policy: nn.Module, config: DictConfig, seed: int, run_dir: str, reference_model: Optional[nn.Module]):
+
+    def __init__(self, policy: nn.Module, config: DictConfig, seed: int, run_dir: str, reference_model: Optional[nn.Module], rank: int = 0, world_size: int = 1):
         """A trainer subclass that uses PyTorch FSDP to shard the model across multiple XLA devices.
         
            This trainer will shard both the policy and reference model across all available XLA devices.
@@ -626,7 +634,7 @@ class FSDPTrainerXLA(BasicTrainer):
 
         super().__init__(policy, config, seed, run_dir, reference_model, 0, 1)
         assert config.model.block_name is not None, 'must specify model.block_name (e.g., GPT2Block or GPTNeoXLayer) for FSDP'
-        print("Initializing FSDPTrainerXLA")
+        rank0_print("Initializing FSDPTrainerXLA")
 
         # Move models to the proper device
         device = xm.xla_device()
@@ -691,8 +699,11 @@ class FSDPTrainerXLA(BasicTrainer):
             eval_iter = tqdm.tqdm(self.eval_iterator, desc="Computing eval metrics")
         else:
             eval_iter = self.eval_iterator
-    
-        for local_eval_batch in eval_iter:
+   
+        for i, local_eval_batch in enumerate(eval_iter):
+            if i > self.config.n_eval_examples / (self.config.batch_size * xm.xrt_world_size()):
+                rank0_print(f"finished {i} eval batches ({self.config.n_eval_examples} examples) with batch size {self.config.batch_size}")
+                break
             # already sliced and moved to correct XLA device by the data loader
             _, eval_metrics = self.get_batch_metrics(local_eval_batch, self.config.loss, train=False, lazy=True)
             for k, v in eval_metrics.items():

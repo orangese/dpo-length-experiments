@@ -62,7 +62,7 @@ def worker_main(rank: int, world_size: int, config: DictConfig, policy: nn.Modul
     TrainerClass = getattr(trainers, config.trainer)
     if config.use_tpu:
         assert "XLA" in config.trainer, "only XLA trainers supported on TPU"
-        print(f"XLA: creating {xm.xrt_world_size()} xrt processes")
+        xm.master_print(f"XLA: created {xm.xrt_world_size()} xrt processes")
     else:
         print(f'Creating trainer on process {rank} with world size {world_size}')
     trainer = TrainerClass(policy, config, config.seed, config.local_run_dir, reference_model=reference_model, rank=rank, world_size=world_size)
@@ -111,17 +111,23 @@ def main(config: DictConfig):
     print('=' * 80)
     print(f'Writing to {socket.gethostname()}:{config.local_run_dir}')
     print('=' * 80)
+    
+    if config.use_tpu:
+        config.model.policy_dtype = "float32"
+        config.model.reference_dtype = "float32"
+        print("NOTE: XLA FDSP requires float32 parameters")
  
     os.environ['XDG_CACHE_HOME'] = get_local_dir(config.local_dirs)
-    print('building policy')
+    print(f'building policy ({config.model.policy_dtype=})')
     model_kwargs = {'device_map': 'balanced'} if config.trainer == 'BasicTrainer' else {}
     policy_dtype = getattr(torch, config.model.policy_dtype)
+
     policy = transformers.AutoModelForCausalLM.from_pretrained(
         config.model.name_or_path, cache_dir=get_local_dir(config.local_dirs), low_cpu_mem_usage=True, torch_dtype=policy_dtype, **model_kwargs)
     disable_dropout(policy)
 
     if config.loss.name == 'dpo' and not config.sample_only:
-        print('building reference model')
+        print(f'building reference model ({config.model.reference_dtype=})')
         reference_model_dtype = getattr(torch, config.model.reference_dtype)
         reference_model = transformers.AutoModelForCausalLM.from_pretrained(
             config.model.name_or_path, cache_dir=get_local_dir(config.local_dirs), low_cpu_mem_usage=True, torch_dtype=reference_model_dtype, **model_kwargs)
@@ -130,12 +136,18 @@ def main(config: DictConfig):
         reference_model = None
 
     if config.model.archive is not None:
-        archive_path = config.model.archive
-        if config.gcp_bucket is not None:
-            print(f"loading archive from gcp path", config.model.archive)
-            state_dict = utils.load_from_gcp(config.model.archive, map_location="cpu")
+        if config.gcp_bucket is not None and config.model.archive.startswith("gs://"):
+            print(f"downloading archive from gcp path", config.model.archive)
+            archive_path = config.model.archive.replace(config.gcp_bucket, os.path.join(get_local_dir(config.local_dirs)))
+            if not os.path.exists(archive_path):
+                utils.download_from_gcp(config.model.archive, archive_path)
+                print(f"downloaded gcp archive to", archive_path)
+            print("loaded gcp archive from", archive_path)
+
         else:
-            state_dict = torch.load(archive_path, map_location='cpu')
+            archive_path = config.model.archive
+
+        state_dict = torch.load(archive_path, map_location='cpu')
         step, metrics = state_dict['step_idx'], state_dict['metrics']
         print(f'loading pre-trained weights at step {step} from {archive_path} with metrics {json.dumps(metrics, indent=2)}')
         policy.load_state_dict(state_dict['state'])
