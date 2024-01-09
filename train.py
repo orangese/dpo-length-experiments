@@ -39,14 +39,17 @@ def worker_sample(rank: int, world_size: int, config: DictConfig, policy: nn.Mod
 
 def worker_main(rank: int, world_size: int, config: DictConfig, policy: nn.Module, reference_model: Optional[nn.Module] = None):
     """Main function for each worker process (may be only 1 for BasicTrainer/TensorParallelTrainer)."""
-    if 'FSDP' in config.trainer and not utils.USING_XLA:
+    utils.USING_XLA = config.use_tpu
+    utils.GCP_BUCKET = config.gcp_bucket
+
+    if 'FSDP' in config.trainer and not config.use_tpu:
         init_distributed(rank, world_size, port=config.fsdp_port)
  
     if config.debug:
         wandb.init = lambda *args, **kwargs: None
         wandb.log = lambda *args, **kwargs: None
 
-    if config.wandb.enabled and ((not utils.USING_XLA and rank == 0) or (utils.USING_XLA and xm.is_master_ordinal(local=False))):
+    if config.wandb.enabled and ((not config.use_tpu and rank == 0) or (config.use_tpu and xm.is_master_ordinal(local=False))):
         os.environ['WANDB_CACHE_DIR'] = get_local_dir(config.local_dirs)
         wandb.init(
             entity=config.wandb.entity,
@@ -57,7 +60,8 @@ def worker_main(rank: int, world_size: int, config: DictConfig, policy: nn.Modul
         )
 
     TrainerClass = getattr(trainers, config.trainer)
-    if utils.USING_XLA:
+    if config.use_tpu:
+        assert "XLA" in config.trainer, "only XLA trainers supported on TPU"
         print(f"XLA: creating {xm.xrt_world_size()} xrt processes")
     else:
         print(f'Creating trainer on process {rank} with world size {world_size}')
@@ -79,12 +83,11 @@ def main(config: DictConfig):
         raise ValueError(f"Got missing keys in config:\n{missing_keys}")
    
     utils.USING_XLA = config.use_tpu
-    print("NOTE: USING_XLA:", utils.USING_XLA)
-    if utils.USING_XLA:
+    print("NOTE: config.use_tpu:", config.use_tpu)
+    if config.use_tpu:
         print("NOTE: FSDP implementation differs on TPU vs GPU; using XLA implementation")
 
     try:
-        utils.GCP_BUCKET = config.gcp_bucket
         print(f"NOTE: using GCP bucket {config.gcp_bucket}")
     except:
         print("NOTE: no GCP bucket provided")
@@ -94,7 +97,7 @@ def main(config: DictConfig):
         print('Setting eval_every to', config.eval_every - config.eval_every % config.batch_size)
         config.eval_every = config.eval_every - config.eval_every % config.batch_size
 
-    if not utils.USING_XLA and 'FSDP' in config.trainer and config.fsdp_port is None:
+    if not config.use_tpu and 'FSDP' in config.trainer and config.fsdp_port is None:
         free_port = get_open_port()
         print('no FSDP port specified; using open port for FSDP:', free_port)
         config.fsdp_port = free_port
@@ -128,7 +131,7 @@ def main(config: DictConfig):
 
     if config.model.archive is not None:
         archive_path = config.model.archive
-        if utils.GCP_BUCKET is not None:
+        if config.gcp_bucket is not None:
             print(f"loading archive from gcp path", config.model.archive)
             state_dict = utils.load_from_gcp(config.model.archive, map_location="cpu")
         else:
@@ -141,7 +144,7 @@ def main(config: DictConfig):
         print('loaded pre-trained weights')
 
     if config.sample_only:
-        assert not utils.USING_XLA, 'sampling not supported on TPU'
+        assert not config.use_tpu, 'sampling not supported on TPU'
         print(f'not training, just sampling (saving to {config.sample_path})')
         worker_sample(0, 1, config, policy)
         return
@@ -151,7 +154,7 @@ def main(config: DictConfig):
         resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
         print(f'setting RLIMIT_NOFILE soft limit to {hard} from {soft}')
     
-        if utils.USING_XLA:
+        if config.use_tpu:
             xmp.spawn(worker_main, args=(1, config, policy, reference_model))
 
         else:

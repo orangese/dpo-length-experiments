@@ -578,6 +578,7 @@ def xla_get_dataloader(names: List[str],
         datasets.logging.disable_progress_bar()
         datasets.logging.set_verbosity_error()
 
+    xm.master_print("using XLA dataloader")
     ds = MapStyleDataset(
         names,
         tokenizer,
