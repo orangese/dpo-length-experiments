@@ -4,6 +4,10 @@ seed: 0
 # name for this experiment in the local run directory and on wandb
 exp_name: pythia-rlcd-test
 
+# xla/tpu stuff
+use_tpu: true
+gcp_bucket: gs://rypark-iris-central2
+
 # sampling stuff that isn't relevant for training
 sample_only: false
 samples_per_prompt: 1
@@ -35,7 +39,7 @@ wandb:
 #   we will try each of these directories in order; if none exist,
 #   we will create the last one and use it
 local_dirs:
-  - /iris/u/rypark/cache
+  - /home/rypark/cache
 
 # whether or not to generate samples during evaluation; disable for FSDP/TensorParallel
 #   is recommended, because they are slow

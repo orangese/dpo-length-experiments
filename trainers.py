@@ -31,6 +31,7 @@ except (ModuleNotFoundError, ImportError):
     print("WARNING: torch_xla not found")
 
 from preference_datasets import get_batch_iterator, xla_get_dataloader
+import utils
 from utils import (
     slice_and_move_batch_for_device,
     formatted_dict,
@@ -40,8 +41,6 @@ from utils import (
     rank0_print,
     get_local_dir,
     upload_to_gcp,
-    USING_XLA,
-    GCP_BUCKET,
 )
 import numpy as np
 import wandb
@@ -164,7 +163,7 @@ class BasicTrainer(object):
            If multiple GPUs are present, naively splits the model across them, effectively
            offering N times available memory, but without any parallel computation.
 
-           If TPUs are available (USING_XLA = True), you must use FDSPTrainerXLA for training! BasicTrainer
+           If TPUs are available (utils.USING_XLA = True), you must use FDSPTrainerXLA for training! BasicTrainer
            will not work, nor will TensorParallelTrainer.
         """
         self.seed = seed
@@ -172,7 +171,7 @@ class BasicTrainer(object):
         self.world_size = world_size
         self.config = config
         self.run_dir = run_dir
-        if USING_XLA or GCP_BUCKET:
+        if utils.USING_XLA or utils.GCP_BUCKET:
             assert not self.config.sample_during_eval, "sampling during training not supported with xla/gcp"
 
         tokenizer_name_or_path = config.model.tokenizer_name_or_path or config.model.name_or_path
@@ -194,19 +193,19 @@ class BasicTrainer(object):
         self.reference_model = reference_model
         
         dataloader_fn = get_batch_iterator
-        if USING_XLA:
+        if utils.USING_XLA:
             dataloader_fn = xla_get_dataloader
             data_iterator_kwargs["device"] = xm.xla_device()
 
         if not no_train:
             self.train_iterator = dataloader_fn(**data_iterator_kwargs, split='train', n_epochs=config.n_epochs, n_examples=config.n_examples, batch_size=config.batch_size, silent=rank != 0, cache_dir=get_local_dir(config.local_dirs))
-            rank0_print(f'Loaded train data iterator ({USING_XLA=})')
+            rank0_print(f'Loaded train data iterator ({utils.USING_XLA=})')
         else:
             self.train_iterator = None
             rank0_print('Did not load train data iterator')
 
         self.eval_iterator = get_batch_iterator(**data_iterator_kwargs, split='test', n_examples=config.n_eval_examples, batch_size=config.eval_batch_size, silent=rank != 0, cache_dir=get_local_dir(config.local_dirs))
-        if not USING_XLA:
+        if not utils.USING_XLA:
             self.eval_batches = None
             rank0_print(f'Loaded {len(self.eval_batches)} eval batches of size {config.eval_batch_size}')
         else:
@@ -505,7 +504,7 @@ class BasicTrainer(object):
             'state': state,
             'metrics': metrics if metrics is not None else {},
         }
-        if USING_XLA:
+        if utils.USING_XLA:
             xm.save(data, output_path, master_only=True)
         else:
             torch.save(data, output_path)

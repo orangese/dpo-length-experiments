@@ -9,6 +9,7 @@ import torch.distributed as dist
 import inspect
 import importlib.util
 import socket
+import gcsfs
 from typing import Dict, Union, Type, List
 
 GCP_BUCKET = None
@@ -53,6 +54,13 @@ def download_from_gcp(gcp_path: str, local_path: str):
         return result.stdout.strip()
     else:
         raise ValueError(f"gsutil download failed: {result.stderr}")
+
+
+def load_from_gcp(gcp_path: str, **kwargs):
+    """Load torch model directly from GCS filesystem"""
+    fs = gcsfs.GCSFileSystem(project=get_gcp_project())
+    with fs.open(gcp_path, "rb") as f:
+        return torch.load(f, **kwargs)
 
 
 def rank0_print(*args, **kwargs):

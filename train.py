@@ -3,7 +3,7 @@ torch.backends.cuda.matmul.allow_tf32 = True
 import torch.nn as nn
 import transformers
 import utils
-from utils import get_local_dir, get_local_run_dir, disable_dropout, init_distributed, get_open_port, USING_XLA
+from utils import get_local_dir, get_local_run_dir, disable_dropout, init_distributed, get_open_port
 import os
 import hydra
 import torch.multiprocessing as mp
@@ -39,14 +39,14 @@ def worker_sample(rank: int, world_size: int, config: DictConfig, policy: nn.Mod
 
 def worker_main(rank: int, world_size: int, config: DictConfig, policy: nn.Module, reference_model: Optional[nn.Module] = None):
     """Main function for each worker process (may be only 1 for BasicTrainer/TensorParallelTrainer)."""
-    if 'FSDP' in config.trainer and not USING_XLA:
+    if 'FSDP' in config.trainer and not utils.USING_XLA:
         init_distributed(rank, world_size, port=config.fsdp_port)
  
     if config.debug:
         wandb.init = lambda *args, **kwargs: None
         wandb.log = lambda *args, **kwargs: None
 
-    if config.wandb.enabled and ((not USING_XLA and rank == 0) or (USING_XLA and xm.is_master_ordinal(local=False))):
+    if config.wandb.enabled and ((not utils.USING_XLA and rank == 0) or (utils.USING_XLA and xm.is_master_ordinal(local=False))):
         os.environ['WANDB_CACHE_DIR'] = get_local_dir(config.local_dirs)
         wandb.init(
             entity=config.wandb.entity,
@@ -57,7 +57,10 @@ def worker_main(rank: int, world_size: int, config: DictConfig, policy: nn.Modul
         )
 
     TrainerClass = getattr(trainers, config.trainer)
-    print(f'Creating trainer on process {rank} with world size {world_size}')
+    if utils.USING_XLA:
+        print(f"XLA: creating {xm.xrt_world_size()} xrt processes")
+    else:
+        print(f'Creating trainer on process {rank} with world size {world_size}')
     trainer = TrainerClass(policy, config, config.seed, config.local_run_dir, reference_model=reference_model, rank=rank, world_size=world_size)
 
     trainer.train()
@@ -74,10 +77,10 @@ def main(config: DictConfig):
     missing_keys: Set[str] = OmegaConf.missing_keys(config)
     if missing_keys:
         raise ValueError(f"Got missing keys in config:\n{missing_keys}")
-    
+   
     utils.USING_XLA = config.use_tpu
-    print("NOTE: USING_XLA:", USING_XLA)
-    if USING_XLA:
+    print("NOTE: USING_XLA:", utils.USING_XLA)
+    if utils.USING_XLA:
         print("NOTE: FSDP implementation differs on TPU vs GPU; using XLA implementation")
 
     try:
@@ -91,7 +94,7 @@ def main(config: DictConfig):
         print('Setting eval_every to', config.eval_every - config.eval_every % config.batch_size)
         config.eval_every = config.eval_every - config.eval_every % config.batch_size
 
-    if not USING_XLA and 'FSDP' in config.trainer and config.fsdp_port is None:
+    if not utils.USING_XLA and 'FSDP' in config.trainer and config.fsdp_port is None:
         free_port = get_open_port()
         print('no FSDP port specified; using open port for FSDP:', free_port)
         config.fsdp_port = free_port
@@ -124,13 +127,12 @@ def main(config: DictConfig):
         reference_model = None
 
     if config.model.archive is not None:
+        archive_path = config.model.archive
         if utils.GCP_BUCKET is not None:
-            archive_path = config.model.archive.replace(os.path.join(utils.GCP_BUCKET, "runs"), get_local_dir(config.local_dirs))
-            print(f'downloading pre-trained weights from {config.model.archive} to {archive_path}')
-            utils.download_from_gcp(config.model.archive, archive_path)
+            print(f"loading archive from gcp path", config.model.archive)
+            state_dict = utils.load_from_gcp(config.model.archive, map_location="cpu")
         else:
-            archive_path = config.model.archive
-        state_dict = torch.load(archive_path, map_location='cpu')
+            state_dict = torch.load(archive_path, map_location='cpu')
         step, metrics = state_dict['step_idx'], state_dict['metrics']
         print(f'loading pre-trained weights at step {step} from {archive_path} with metrics {json.dumps(metrics, indent=2)}')
         policy.load_state_dict(state_dict['state'])
@@ -139,7 +141,7 @@ def main(config: DictConfig):
         print('loaded pre-trained weights')
 
     if config.sample_only:
-        assert not USING_XLA, 'sampling not supported on TPU'
+        assert not utils.USING_XLA, 'sampling not supported on TPU'
         print(f'not training, just sampling (saving to {config.sample_path})')
         worker_sample(0, 1, config, policy)
         return
@@ -149,9 +151,8 @@ def main(config: DictConfig):
         resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
         print(f'setting RLIMIT_NOFILE soft limit to {hard} from {soft}')
     
-        if USING_XLA:
-            print(f'XLA: starting {xm.xrt_world_size()} processes for FSDP training')
-            xmp.spawn(worker_main, args=(1, config, policy, reference_model), nprocs=xm.xrt_world_size())
+        if utils.USING_XLA:
+            xmp.spawn(worker_main, args=(1, config, policy, reference_model))
 
         else:
             world_size = torch.cuda.device_count()
