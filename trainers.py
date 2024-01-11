@@ -256,15 +256,15 @@ class BasicTrainer(object):
                 rejected_rewards = all_gather_if_needed(rejected_rewards, self.rank, self.world_size)
                 reward_accuracies = all_gather_if_needed(reward_accuracies, self.rank, self.world_size)
 
-            metrics[f'rewards_{train_test}/chosen'] = chosen_rewards.cpu().numpy().tolist()
-            metrics[f'rewards_{train_test}/rejected'] = rejected_rewards.cpu().numpy().tolist()
-            metrics[f'rewards_{train_test}/accuracies'] = reward_accuracies.cpu().numpy().tolist()
-            metrics[f'rewards_{train_test}/margins'] = (chosen_rewards - rejected_rewards).cpu().numpy().tolist()
+            metrics[f'rewards_{train_test}/chosen'] = chosen_rewards
+            metrics[f'rewards_{train_test}/rejected'] = rejected_rewards
+            metrics[f'rewards_{train_test}/accuracies'] = reward_accuracies
+            metrics[f'rewards_{train_test}/margins'] = chosen_rewards - rejected_rewards
 
             policy_rejected_logps = policy_rejected_logps.detach()
             if not lazy:
                 policy_rejected_logps = all_gather_if_needed(policy_rejected_logps, self.rank, self.world_size)
-            metrics[f'logps_{train_test}/rejected'] = policy_rejected_logps.cpu().numpy().tolist()
+            metrics[f'logps_{train_test}/rejected'] = policy_rejected_logps
 
         elif loss_config.name == 'sft':
             policy_chosen_logits = self.policy(batch['chosen_input_ids'], attention_mask=batch['chosen_attention_mask']).logits.to(torch.float32)
@@ -275,12 +275,18 @@ class BasicTrainer(object):
         policy_chosen_logps = policy_chosen_logps.detach()
         if not lazy:
             policy_chosen_logps = all_gather_if_needed(policy_chosen_logps, self.rank, self.world_size)
-        metrics[f'logps_{train_test}/chosen'] = policy_chosen_logps.cpu().numpy().tolist()
+        metrics[f'logps_{train_test}/chosen'] = policy_chosen_logps
 
         losses_view = losses.detach()
         if not lazy:
             losses_view = all_gather_if_needed(losses_view, self.rank, self.world_size)
-        metrics[f'loss/{train_test}'] = losses_view.cpu().numpy().tolist()
+        metrics[f'loss/{train_test}'] = losses_view
+ 
+        if not lazy:
+            # do NOT execute with XLA! no native lowering implemented, will use xla->cpu callback
+            # unsure if detach() is even a good idea with xla?
+            for k, v in metrics.items():
+                metrics[k] = v.cpu().numpy().tolist()
 
         return losses.mean(), metrics
 
@@ -652,13 +658,13 @@ class FSDPTrainerXLA(BasicTrainer):
     @staticmethod
     def _reduce_dict(dict_list):
         """Given list of dicts with same key sets, reduces into one dict by taking the 
-        average over each key. Each key in each dict will map to a list of values."""
+        average over each key. Each key in each dict will map to a 1-D tensor of values."""
         result = {}
         for k in dict_list[0].keys():
-            result[k] = []
+            result[k] = 0
             for d in dict_list:
-                result[k].extend(d[k])
-        return {k: sum(v) / len(v) for k, v in result.items()}
+                result[k] += d[k].mean()
+        return {k: v.item() / len(dict_list) for k, v in result.items()}
 
     @torch.no_grad
     def do_eval(self):
