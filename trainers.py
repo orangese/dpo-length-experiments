@@ -111,14 +111,13 @@ def _get_batch_logps(logits: torch.FloatTensor, labels: torch.LongTensor, averag
     Returns:
         A tensor of shape (batch_size,) containing the average/sum log probabilities of the given labels under the given logits.
     """
-    assert logits.shape[:-1] == labels.shape
-
     labels = labels[:, 1:].clone()
     logits = logits[:, :-1, :]
     loss_mask = (labels != -100)
 
     # dummy token; we'll ignore the losses on these tokens later
-    labels[labels == -100] = 0
+    #labels[labels == -100] = 0
+    labels = torch.where(~loss_mask, torch.zeros_like(labels), labels)
 
     per_token_logps = torch.gather(logits.log_softmax(-1), dim=2, index=labels.unsqueeze(2)).squeeze(2)
 
@@ -126,33 +125,6 @@ def _get_batch_logps(logits: torch.FloatTensor, labels: torch.LongTensor, averag
         return (per_token_logps * loss_mask).sum(-1) / loss_mask.sum(-1)
     else:
         return (per_token_logps * loss_mask).sum(-1)
-
-
-def concatenated_inputs(batch: Dict[str, Union[List, torch.LongTensor]]) -> Dict[str, torch.LongTensor]:
-    """Concatenate the chosen and rejected inputs into a single tensor.
-    
-    Args:
-        batch: A batch of data. Must contain the keys 'chosen_input_ids' and 'rejected_input_ids', which are tensors of shape (batch_size, sequence_length).
-        
-    Returns:
-        A dictionary containing the concatenated inputs under the key 'concatenated_input_ids'.
-    """
-    max_length = max(batch['chosen_input_ids'].shape[1], batch['rejected_input_ids'].shape[1])
-    concatenated_batch = {}
-    for k in batch:
-        if k.startswith('chosen') and isinstance(batch[k], torch.Tensor):
-            pad_value = -100 if 'labels' in k else 0
-            concatenated_key = k.replace('chosen', 'concatenated')
-            concatenated_batch[concatenated_key] = pad_to_length(batch[k], max_length, pad_value=pad_value)
-    for k in batch:
-        if k.startswith('rejected') and isinstance(batch[k], torch.Tensor):
-            pad_value = -100 if 'labels' in k else 0
-            concatenated_key = k.replace('rejected', 'concatenated')
-            concatenated_batch[concatenated_key] = torch.cat((
-                concatenated_batch[concatenated_key],
-                pad_to_length(batch[k], max_length, pad_value=pad_value),
-            ), dim=0)
-    return concatenated_batch
 
 
 class BasicTrainer(object):
@@ -251,9 +223,8 @@ class BasicTrainer(object):
         
            We do this to avoid doing two forward passes, because it's faster for FSDP.
         """
-        concatenated_batch = concatenated_inputs(batch)
-        all_logits = model(concatenated_batch['concatenated_input_ids'], attention_mask=concatenated_batch['concatenated_attention_mask']).logits.to(torch.float32)
-        all_logps = _get_batch_logps(all_logits, concatenated_batch['concatenated_labels'], average_log_prob=False)
+        all_logits = model(batch['concatenated_input_ids'], attention_mask=batch['concatenated_attention_mask']).logits.to(torch.float32)
+        all_logps = _get_batch_logps(all_logits, batch['concatenated_labels'], average_log_prob=False)
         chosen_logps = all_logps[:batch['chosen_input_ids'].shape[0]]
         rejected_logps = all_logps[batch['chosen_input_ids'].shape[0]:]
         return chosen_logps, rejected_logps
@@ -757,7 +728,9 @@ class FSDPTrainerXLA(BasicTrainer):
                 batch_metrics[k].append(v)
 
         # clip gradients and update parameters
-        grad_norm = self.clip_gradient()
+        # (do not record gradient norm since it requires explicit access of intermediate tensor via item()
+        # which doesn't have a native XLA translation)
+        self.clip_gradient()
         self.optimizer.step()
         self.scheduler.step()
         self.optimizer.zero_grad()
@@ -766,7 +739,6 @@ class FSDPTrainerXLA(BasicTrainer):
         step_time = time.time() - start_time
         examples_per_second = self.config.batch_size / step_time
         batch_metrics['examples_per_second'].append(examples_per_second)
-        batch_metrics['grad_norm'].append(grad_norm)
 
         self.batch_counter += 1
         self.example_counter += self.config.batch_size
@@ -783,7 +755,7 @@ class FSDPTrainerXLA(BasicTrainer):
     
     def clip_gradient(self):
         """Clip the gradient norm of the parameters of an FSDP policy, gathering the gradients across all XLA devices."""
-        return self.policy.clip_grad_norm_(self.config.max_grad_norm).item()
+        return self.policy.clip_grad_norm_(self.config.max_grad_norm)
 
     def save(self, output_dir=None, metrics=None):
         """Save policy, optimizer, and scheduler state to disk."""
