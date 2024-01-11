@@ -27,6 +27,7 @@ try:
         checkpoint_module,
     )
     from torch_xla.distributed.fsdp.wrap import transformer_auto_wrap_policy
+    import torch_xla.debug.metrics as met
 except (ModuleNotFoundError, ImportError):
     print("WARNING: torch_xla not found")
 
@@ -679,6 +680,8 @@ class FSDPTrainerXLA(BasicTrainer):
             _, eval_metrics = self.get_batch_metrics(local_eval_batch, self.config.loss, train=False, lazy=True)
             for k, v in eval_metrics.items():
                 all_eval_metrics[k].extend(v)
+            if i == 0 or i % 5 == 0:
+                xm.master_print(met.metrics_report())
 
         # now we can mesh reduce across all processes
         mean_eval_metrics = xm.mesh_reduce('eval_metrics', all_eval_metrics, FSDPTrainerXLA._reduce_dict)

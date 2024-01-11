@@ -374,17 +374,6 @@ def get_dataset(name: str, split: str, silent: bool = False, cache_dir: str = No
     return data
 
 
-def concatenated_inputs(batch: Dict[str, Union[List, torch.LongTensor]]) -> Dict[str, torch.LongTensor]:
-    """Concatenate the chosen and rejected inputs into a single tensor.
-    
-    Args:
-        batch: A batch of data. Must contain the keys 'chosen_input_ids' and 'rejected_input_ids', which are tensors of shape (batch_size, sequence_length).
-        
-    Returns:
-        A dictionary containing the concatenated inputs under the key 'concatenated_input_ids'.
-    """
-
-
 def _collate_fn(batch, tokenizer) -> Dict[str, Union[List, torch.Tensor]]:
     """The collate function takes a list of examples (dicts, where values are lists of
     ints [tokens] or strings [the original texts]) and returns a batch of examples,
@@ -416,21 +405,20 @@ def _collate_fn(batch, tokenizer) -> Dict[str, Union[List, torch.Tensor]]:
 
     # then, concatenate the chosen and rejected inputs into a single tensor
     max_length = max(padded_batch['chosen_input_ids'].shape[1], padded_batch['rejected_input_ids'].shape[1])
-    concatenated_batch = {}
     for k in padded_batch:
         if k.startswith('chosen') and isinstance(padded_batch[k], torch.Tensor):
             pad_value = -100 if 'labels' in k else 0
             concatenated_key = k.replace('chosen', 'concatenated')
-            concatenated_batch[concatenated_key] = pad_to_length(padded_batch[k], max_length, pad_value=pad_value)
+            padded_batch[concatenated_key] = pad_to_length(padded_batch[k], max_length, pad_value=pad_value)
     for k in padded_batch:
         if k.startswith('rejected') and isinstance(padded_batch[k], torch.Tensor):
             pad_value = -100 if 'labels' in k else 0
             concatenated_key = k.replace('rejected', 'concatenated')
-            concatenated_batch[concatenated_key] = torch.cat((
-                concatenated_batch[concatenated_key],
+            padded_batch[concatenated_key] = torch.cat((
+                concatenated_key[concatenated_key],
                 pad_to_length(padded_batch[k], max_length, pad_value=pad_value),
             ), dim=0)
-    return concatenated_batch
+    return padded_batch
 
 
 def tokenize_batch_element(prompt: str, chosen: str, rejected: str, truncation_mode: str, tokenizer, max_length: int, max_prompt_length: int) -> Dict:
