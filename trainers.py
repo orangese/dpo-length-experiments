@@ -59,8 +59,8 @@ def dpo_loss(policy_chosen_logps: torch.FloatTensor,
              policy_rejected_logps: torch.FloatTensor,
              reference_chosen_logps: torch.FloatTensor,
              reference_rejected_logps: torch.FloatTensor,
-             beta: float,
-             alpha: float,
+             beta: torch.FloatTensor,
+             alpha: torch.FloatTensor,
              chosen_len: torch.FloatTensor,
              rejected_len: torch.FloatTensor,
              reference_free: bool = False) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
@@ -85,14 +85,8 @@ def dpo_loss(policy_chosen_logps: torch.FloatTensor,
     pi_logratios = policy_chosen_logps - policy_rejected_logps
     ref_logratios = reference_chosen_logps - reference_rejected_logps
 
-    if reference_free:
-        ref_logratios = 0
-
     logits = pi_logratios - ref_logratios
-    unscaled = beta * logits
-
-    if alpha != 0:
-        unscaled -= alpha * rejected_len - alpha * chosen_len
+    unscaled = beta * logits - alpha * rejected_len - alpha * chosen_len
 
     losses = -F.logsigmoid(unscaled)
     chosen_rewards = beta * (policy_chosen_logps - reference_chosen_logps).detach()
@@ -117,15 +111,10 @@ def _get_batch_logps(logits: torch.FloatTensor, labels: torch.LongTensor, averag
     loss_mask = (labels != -100)
 
     # dummy token; we'll ignore the losses on these tokens later
-    #labels[labels == -100] = 0
     labels = torch.where(~loss_mask, torch.zeros_like(labels), labels)
-
     per_token_logps = torch.gather(logits.log_softmax(-1), dim=2, index=labels.unsqueeze(2)).squeeze(2)
 
-    if average_log_prob:
-        return (per_token_logps * loss_mask).sum(-1) / loss_mask.sum(-1)
-    else:
-        return (per_token_logps * loss_mask).sum(-1)
+    return (per_token_logps * loss_mask).sum(-1)
 
 
 class BasicTrainer(object):
@@ -145,6 +134,7 @@ class BasicTrainer(object):
         self.run_dir = run_dir
         if config.use_tpu or config.gcp_bucket:
             assert not self.config.sample_during_eval, "sampling during training not supported with xla/gcp"
+            assert self.config.batch_size == self.config.eval_batch_size, "train batch size and eval batch size must be the same on xla"
 
         tokenizer_name_or_path = config.model.tokenizer_name_or_path or config.model.name_or_path
         rank0_print(f'Loading tokenizer {tokenizer_name_or_path}')
@@ -226,13 +216,12 @@ class BasicTrainer(object):
         """
         all_logits = model(batch['concatenated_input_ids'], attention_mask=batch['concatenated_attention_mask']).logits.to(torch.float32)
         all_logps = _get_batch_logps(all_logits, batch['concatenated_labels'], average_log_prob=False)
-        chosen_logps = all_logps[:batch['chosen_input_ids'].shape[0]]
-        rejected_logps = all_logps[batch['chosen_input_ids'].shape[0]:]
+        chosen_logps = all_logps[:self.config.batch_size]
+        rejected_logps = all_logps[self.config.batch_size:]
         return chosen_logps, rejected_logps
 
     def get_batch_metrics(self, batch: Dict[str, Union[List, torch.LongTensor]], loss_config: DictConfig, train=True, lazy=False):
         """Compute the SFT or DPO loss and other metrics for the given batch of inputs."""
-
         metrics = {}
         train_test = 'train' if train else 'eval'
 
@@ -252,18 +241,17 @@ class BasicTrainer(object):
             reward_accuracies = (chosen_rewards > rejected_rewards).float()
 
             if not lazy:
-                chosen_rewards = all_gather_if_needed(chosen_rewards, self.rank, self.world_size)
-                rejected_rewards = all_gather_if_needed(rejected_rewards, self.rank, self.world_size)
-                reward_accuracies = all_gather_if_needed(reward_accuracies, self.rank, self.world_size)
+                chosen_rewards = all_gather_if_needed(chosen_rewards.detach(), self.rank, self.world_size)
+                rejected_rewards = all_gather_if_needed(rejected_rewards.detach(), self.rank, self.world_size)
+                reward_accuracies = all_gather_if_needed(reward_accuracies.detach(), self.rank, self.world_size)
 
             metrics[f'rewards_{train_test}/chosen'] = chosen_rewards
             metrics[f'rewards_{train_test}/rejected'] = rejected_rewards
             metrics[f'rewards_{train_test}/accuracies'] = reward_accuracies
             metrics[f'rewards_{train_test}/margins'] = chosen_rewards - rejected_rewards
 
-            policy_rejected_logps = policy_rejected_logps.detach()
             if not lazy:
-                policy_rejected_logps = all_gather_if_needed(policy_rejected_logps, self.rank, self.world_size)
+                policy_rejected_logps = all_gather_if_needed(policy_rejected_logps.detach(), self.rank, self.world_size)
             metrics[f'logps_{train_test}/rejected'] = policy_rejected_logps
 
         elif loss_config.name == 'sft':
@@ -272,14 +260,13 @@ class BasicTrainer(object):
 
             losses = -policy_chosen_logps
 
-        policy_chosen_logps = policy_chosen_logps.detach()
         if not lazy:
-            policy_chosen_logps = all_gather_if_needed(policy_chosen_logps, self.rank, self.world_size)
+            policy_chosen_logps = all_gather_if_needed(policy_chosen_logps.detach(), self.rank, self.world_size)
         metrics[f'logps_{train_test}/chosen'] = policy_chosen_logps
 
-        losses_view = losses.detach()
+        losses_view = losses
         if not lazy:
-            losses_view = all_gather_if_needed(losses_view, self.rank, self.world_size)
+            losses_view = all_gather_if_needed(losses_view.detach(), self.rank, self.world_size)
         metrics[f'loss/{train_test}'] = losses_view
  
         if not lazy:
@@ -673,21 +660,22 @@ class FSDPTrainerXLA(BasicTrainer):
         rank0_print(f'Running evaluation after {self.example_counter} train examples')
 
         all_eval_metrics = defaultdict(list)
+        nb = self.config.n_eval_examples / (self.config.eval_batch_size * xm.xrt_world_size())
         if xm.is_master_ordinal(local=False):
-            eval_iter = tqdm.tqdm(self.eval_iterator, desc="Computing eval metrics")
+            eval_iter = tqdm.tqdm(self.eval_iterator, desc="Computing eval metrics", total=nb)
         else:
             eval_iter = self.eval_iterator
    
         for i, local_eval_batch in enumerate(eval_iter):
-            if i > self.config.n_eval_examples / (self.config.batch_size * xm.xrt_world_size()):
+            if i > nb:
                 rank0_print(f"finished {i} eval batches ({self.config.n_eval_examples} examples) with batch size {self.config.batch_size}")
                 break
             # already sliced and moved to correct XLA device by the data loader
             _, eval_metrics = self.get_batch_metrics(local_eval_batch, self.config.loss, train=False, lazy=True)
             for k, v in eval_metrics.items():
                 all_eval_metrics[k].extend(v)
-            if i == 0 or i % 5 == 0:
-                xm.master_print(met.metrics_report())
+            xm.master_print(met.metrics_report())
+            xm.master_print(f"nb={nb}, {self.config.n_eval_examples=}, {self.config.eval_batch_size=}, {xm.xrt_world_size()=}")
 
         # now we can mesh reduce across all processes
         mean_eval_metrics = xm.mesh_reduce('eval_metrics', all_eval_metrics, FSDPTrainerXLA._reduce_dict)

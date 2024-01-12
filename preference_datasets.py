@@ -374,7 +374,7 @@ def get_dataset(name: str, split: str, silent: bool = False, cache_dir: str = No
     return data
 
 
-def _collate_fn(batch, tokenizer) -> Dict[str, Union[List, torch.Tensor]]:
+def _collate_fn(batch, tokenizer, max_length=None) -> Dict[str, Union[List, torch.Tensor]]:
     """The collate function takes a list of examples (dicts, where values are lists of
     ints [tokens] or strings [the original texts]) and returns a batch of examples,
     PyTorch tensors padded to the maximum length. Strings are passed through."""
@@ -404,18 +404,20 @@ def _collate_fn(batch, tokenizer) -> Dict[str, Union[List, torch.Tensor]]:
             padded_batch[k] = [ex[k] for ex in batch]
 
     # then, concatenate the chosen and rejected inputs into a single tensor
-    max_length = max(padded_batch['chosen_input_ids'].shape[1], padded_batch['rejected_input_ids'].shape[1])
-    for k in padded_batch:
+    if max_length is None:  # for xla, specify max len to avoid unnecessary recompiles
+        max_length = max(padded_batch['chosen_input_ids'].shape[1], padded_batch['rejected_input_ids'].shape[1])
+    rank0_print(f"using max length = {max_length}")
+    for k in list(padded_batch.keys()):
         if k.startswith('chosen') and isinstance(padded_batch[k], torch.Tensor):
             pad_value = -100 if 'labels' in k else 0
             concatenated_key = k.replace('chosen', 'concatenated')
             padded_batch[concatenated_key] = pad_to_length(padded_batch[k], max_length, pad_value=pad_value)
-    for k in padded_batch:
+    for k in list(padded_batch.keys()):
         if k.startswith('rejected') and isinstance(padded_batch[k], torch.Tensor):
             pad_value = -100 if 'labels' in k else 0
             concatenated_key = k.replace('rejected', 'concatenated')
             padded_batch[concatenated_key] = torch.cat((
-                concatenated_key[concatenated_key],
+                padded_batch[concatenated_key],
                 pad_to_length(padded_batch[k], max_length, pad_value=pad_value),
             ), dim=0)
     return padded_batch
@@ -621,7 +623,7 @@ def xla_get_dataloader(names: List[str],
         shuffle=shuffle and sampler is None,
         drop_last=False,
         num_workers=num_workers,
-        collate_fn=partial(_collate_fn, tokenizer=tokenizer)
+        collate_fn=partial(_collate_fn, tokenizer=tokenizer, max_length=max_length)
     )
 
     device_loader = pl.MpDeviceLoader(dataloader, device)
