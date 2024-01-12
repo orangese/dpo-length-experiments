@@ -238,20 +238,23 @@ class BasicTrainer(object):
                 chosen_len=batch["chosen_len"],
                 rejected_len=batch["rejected_len"]
             )
+            chosen_rewards = chosen_rewards.detach()
+            rejected_rewards = rejected_rewards.detach()
             reward_accuracies = (chosen_rewards > rejected_rewards).float()
 
             if not lazy:
-                chosen_rewards = all_gather_if_needed(chosen_rewards.detach(), self.rank, self.world_size)
-                rejected_rewards = all_gather_if_needed(rejected_rewards.detach(), self.rank, self.world_size)
-                reward_accuracies = all_gather_if_needed(reward_accuracies.detach(), self.rank, self.world_size)
+                chosen_rewards = all_gather_if_needed(chosen_rewards, self.rank, self.world_size)
+                rejected_rewards = all_gather_if_needed(rejected_rewards, self.rank, self.world_size)
+                reward_accuracies = all_gather_if_needed(reward_accuracies, self.rank, self.world_size)
 
             metrics[f'rewards_{train_test}/chosen'] = chosen_rewards
             metrics[f'rewards_{train_test}/rejected'] = rejected_rewards
             metrics[f'rewards_{train_test}/accuracies'] = reward_accuracies
             metrics[f'rewards_{train_test}/margins'] = chosen_rewards - rejected_rewards
 
+            policy_rejected_logps = policy_rejected_logps.detach()
             if not lazy:
-                policy_rejected_logps = all_gather_if_needed(policy_rejected_logps.detach(), self.rank, self.world_size)
+                policy_rejected_logps = all_gather_if_needed(policy_rejected_logps, self.rank, self.world_size)
             metrics[f'logps_{train_test}/rejected'] = policy_rejected_logps
 
         elif loss_config.name == 'sft':
@@ -260,13 +263,14 @@ class BasicTrainer(object):
 
             losses = -policy_chosen_logps
 
+        policy_chosen_logps = policy_chosen_logps.detach()
         if not lazy:
-            policy_chosen_logps = all_gather_if_needed(policy_chosen_logps.detach(), self.rank, self.world_size)
+            policy_chosen_logps = all_gather_if_needed(policy_chosen_logps, self.rank, self.world_size)
         metrics[f'logps_{train_test}/chosen'] = policy_chosen_logps
 
-        losses_view = losses
+        losses_view = losses.detach()
         if not lazy:
-            losses_view = all_gather_if_needed(losses_view.detach(), self.rank, self.world_size)
+            losses_view = all_gather_if_needed(losses_view, self.rank, self.world_size)
         metrics[f'loss/{train_test}'] = losses_view
  
         if not lazy:
@@ -676,6 +680,7 @@ class FSDPTrainerXLA(BasicTrainer):
                 all_eval_metrics[k].extend(v)
             xm.master_print(met.metrics_report())
             xm.master_print(f"nb={nb}, {self.config.n_eval_examples=}, {self.config.eval_batch_size=}, {xm.xrt_world_size()=}")
+            xm.master_print(all_eval_metrics)
 
         # now we can mesh reduce across all processes
         mean_eval_metrics = xm.mesh_reduce('eval_metrics', all_eval_metrics, FSDPTrainerXLA._reduce_dict)

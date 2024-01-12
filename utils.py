@@ -20,6 +20,24 @@ except (ModuleNotFoundError, ImportError):
     print("WARNING: torch_xla not found")
 
 
+def fmt_msg(msg, master=False):
+    """Format a message with timestamp and ordinal."""
+    ordinal = xm.get_ordinal() if not master else "MASTER"
+    now = datetime.now()
+    time_fmt = now.strftime("%m-%d %H:%M:%S") + "." + str(now.microsecond)[:3]
+    return f"[{time_fmt}] [XM:{ordinal}] {msg}"
+
+
+def mprint(msg):
+    """Master print on master ordinal"""
+    xm.master_print(fmt_msg(msg, master=True))
+
+
+def lprint(msg):
+    """Local print on any ordinal"""
+    print(fmt_msg(msg))
+
+
 def get_open_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(('', 0)) # bind to all interfaces and use an OS provided port
