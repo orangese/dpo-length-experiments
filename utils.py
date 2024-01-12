@@ -25,12 +25,16 @@ def fmt_msg(msg, master=False):
     ordinal = xm.get_ordinal() if not master else "MASTER"
     now = datetime.now()
     time_fmt = now.strftime("%m-%d %H:%M:%S") + "." + str(now.microsecond)[:3]
-    return f"[{time_fmt}] [XM:{ordinal}] {msg}"
+    return f"[{time_fmt}] [WORKER:{ordinal}] {msg}"
 
 
 def mprint(msg):
     """Master print on master ordinal"""
-    xm.master_print(fmt_msg(msg, master=True))
+    if dist.is_initialized():
+        if dist.get_rank() == 0:
+            print(fmt_msg(msg, master=True))
+    else:
+        xm.master_print(fmt_msg(msg, master=True))
 
 
 def lprint(msg):
@@ -81,7 +85,7 @@ def load_from_gcp(gcp_path: str, **kwargs):
         return torch.load(f, **kwargs)
 
 
-def rank0_print(*args, **kwargs):
+def mprint(*args, **kwargs):
     """Print, but only on rank 0."""
     if USING_XLA:
         xm.master_print(*args, **kwargs)

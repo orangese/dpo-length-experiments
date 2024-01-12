@@ -13,12 +13,12 @@ import random
 from bs4 import BeautifulSoup, NavigableString
 import numpy as np
 from typing import Dict, List, Optional, Iterator, Union, Tuple
-from utils import rank0_print, pad_to_length
+from utils import mprint, pad_to_length
 try:
     import torch_xla.core.xla_model as xm
     import torch_xla.distributed.parallel_loader as pl
 except (ModuleNotFoundError, ImportError):
-    rank0_print("WARNING: torch_xla not found")
+    mprint("WARNING: torch_xla not found")
 
 
 def extract_anthropic_prompt(prompt_and_response):
@@ -68,11 +68,11 @@ def load_dataset(hf_code, split=None, cache_dir=None, bucket=GCP_BUCKET):
 
     output_dir = "gs://" + os.path.join(bucket, "datasets", hf_code)
     if not fs.exists(output_dir):
-        rank0_print(f"downloading and preparing {hf_code} to gcp location '{output_dir}'")
+        mprint(f"downloading and preparing {hf_code} to gcp location '{output_dir}'")
         ds = datasets.load_dataset(hf_code, cache_dir=cache_dir, split=split)
         ds.save_to_disk(output_dir)
 
-    rank0_print(f"loading {hf_code} from gcp location '{output_dir}'")
+    mprint(f"loading {hf_code} from gcp location '{output_dir}'")
     ds = datasets.load_from_disk(output_dir, storage_options=storage_options)
     if split is None:
         return ds
@@ -84,9 +84,8 @@ def get_se(split, silent=False, cache_dir: str = None) -> Dict[str, Dict[str, Un
     
        We strip the HTML tags from the responses (except for <code> tags), and we add necessary newlines.
     """
-    rank0_print(f'Loading SE dataset ({split} split) from Huggingface...')
+    mprint(f'Loading SE dataset ({split} split) from Huggingface...')
     dataset = load_dataset('HuggingFaceH4/stack-exchange-preferences', cache_dir=cache_dir)['train']
-    rank0_print('done')
 
     # shuffle the dataset and select 1% for test
     dataset = dataset.shuffle(seed=42)
@@ -124,9 +123,8 @@ def get_shp(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str
        We filter preference pairs to only keep pairs where the score ratio is at least 2.
        For this dataset, the sft_target is the response with the highest score.
     """
-    rank0_print(f'Loading SHP dataset ({split} split) from Huggingface...')
+    mprint(f'Loading SHP dataset ({split} split) from Huggingface...')
     dataset = load_dataset('stanfordnlp/SHP', split=split, cache_dir=cache_dir)
-    rank0_print('done')
 
     data = defaultdict(lambda: defaultdict(list))
     for row in tqdm.tqdm(dataset, desc='Processing SHP', disable=silent):
@@ -154,9 +152,8 @@ def get_shp(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str
 
 
 def get_webgpt(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str, Dict[str, Union[List[Tuple[int, int]], List[str], str]]]:
-    rank0_print(f'Loading WebGPT dataset ({split}) from Huggingface...')
+    mprint(f'Loading WebGPT dataset ({split}) from Huggingface...')
     dataset = load_dataset("openai/webgpt_comparisons", split=split, cache_dir=cache_dir)
-    rank0_print('done')
 
     def split_prompt_and_responses(row):
         prompt = row["question"]["full_text"]
@@ -184,9 +181,8 @@ def get_rlcd(split: str, silent: bool = False, cache_dir: str = None) -> Dict[st
         split = "validation"
         # only "train", "validation" available
 
-    rank0_print(f'Loading RLCD dataset ({split}) from Huggingface...')
+    mprint(f'Loading RLCD dataset ({split}) from Huggingface...')
     dataset = load_dataset("TaylorAI/RLCD-generated-preference-data-split", split=split, cache_dir=cache_dir)
-    rank0_print('done', len(dataset))
 
     def split_prompt_and_responses(row):
         prompt = (row["instruction"] or "") + (row["input"] or "")
@@ -209,10 +205,9 @@ def get_rlcd(split: str, silent: bool = False, cache_dir: str = None) -> Dict[st
 
 def get_alpaca(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str, Dict[str, Union[List[Tuple[int, int]], List[str], str]]]:
     """Load the AlpacaFarm dataset."""
-    rank0_print(f'Loading AlpacaFarm dataset (split=all, ignoring arg) locally...')
+    mprint(f'Loading AlpacaFarm dataset (split=all, ignoring arg) locally...')
     with open(os.path.join("data/farm/alpaca_human_preference.json"), 'r') as f:
         dataset = json.load(f)
-    rank0_print('done')
 
     def split_prompt_and_responses(row):
         prompt = row["instruction"] + row["input"]
@@ -234,10 +229,9 @@ def get_alpaca(split: str, silent: bool = False, cache_dir: str = None) -> Dict[
 
 
 def get_stack(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str, Dict[str, Union[List[Tuple[int, int]], List[str], str]]]:
-    rank0_print(f'Loading SE stack dataset (split={split}) from huggingface...')
+    mprint(f'Loading SE stack dataset (split={split}) from huggingface...')
     dataset = load_dataset("lvwerra/stack-exchange-paired", split=split, cache_dir=cache_dir)
     dataset = dataset.select(range(100000))  # see https://github.com/huggingface/trl
-    rank0_print('done')
 
     def split_prompt_and_responses(row):
         prompt = row["question"]
@@ -259,7 +253,7 @@ def get_stack(split: str, silent: bool = False, cache_dir: str = None) -> Dict[s
 def load_tldr(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str, Dict[str, Union[List[Tuple[int, int]], List[str], str]]]:
     datapath = "data/tldr/comparisons"
 
-    rank0_print(f"Loading TLDR dataset from {datapath} with '{split}' split, locally...")
+    mprint(f"Loading TLDR dataset from {datapath} with '{split}' split, locally...")
     tldr = []
     train_re = r"batch([3-9]|10)\.json"
 
@@ -285,7 +279,7 @@ def load_tldr(split: str, silent: bool = False, cache_dir: str = None) -> Dict[s
                     "chosen": y1 if sample["choice"] == 0 else y2,
                     "rejected": y2 if sample["choice"] == 0 else y1
                 })
-    rank0_print("done")
+    mprint("done")
 
     def split_prompt_and_responses(row):
         prompt = row["prompt"]
@@ -325,9 +319,8 @@ def get_hh(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str,
        
        For this dataset, the sft_target is just the chosen response.
     """
-    rank0_print(f'Loading HH dataset ({split} split) from Huggingface...')
+    mprint(f'Loading HH dataset ({split} split) from Huggingface...')
     dataset = load_dataset('Anthropic/hh-rlhf', split=split, cache_dir=cache_dir)
-    rank0_print('done')
 
     def split_prompt_and_responses(ex):
         prompt = extract_anthropic_prompt(ex['chosen'])
@@ -406,7 +399,7 @@ def _collate_fn(batch, tokenizer, max_length=None) -> Dict[str, Union[List, torc
     # then, concatenate the chosen and rejected inputs into a single tensor
     if max_length is None:  # for xla, specify max len to avoid unnecessary recompiles
         max_length = max(padded_batch['chosen_input_ids'].shape[1], padded_batch['rejected_input_ids'].shape[1])
-    rank0_print(f"using max length = {max_length}")
+    mprint(f"using max length = {max_length}")
     for k in list(padded_batch.keys()):
         if k.startswith('chosen') and isinstance(padded_batch[k], torch.Tensor):
             pad_value = -100 if 'labels' in k else 0
@@ -588,12 +581,12 @@ def xla_get_dataloader(names: List[str],
     
     # First, construct map-style dataset
     if n_epochs is not None or n_examples is not None:
-        rank0_print("warning: ignoring n_epochs/n_examples in xla dataloader")
+        mprint("warning: ignoring n_epochs/n_examples in xla dataloader")
     if silent:
         datasets.logging.disable_progress_bar()
         datasets.logging.set_verbosity_error()
 
-    rank0_print("using XLA dataloader")
+    mprint("using XLA dataloader")
     ds = MapStyleDataset(
         names,
         tokenizer,
@@ -680,7 +673,7 @@ def get_batch_iterator(names: List[str],
     while True:
         if n_epochs is not None and epoch_idx >= n_epochs:
             if not silent:
-                rank0_print(f'Finished generating {n_epochs} epochs on {split} split')
+                mprint(f'Finished generating {n_epochs} epochs on {split} split')
             break
         if shuffle:
             with TemporarilySeededRandom(next(permutation_seeds)):
@@ -699,7 +692,7 @@ def get_batch_iterator(names: List[str],
                     yield collate_fn(batch)
                     if n_examples is not None and example_idx >= n_examples:
                         if not silent:
-                            rank0_print(f'Finished generating {n_examples} examples on {split} split')
+                            mprint(f'Finished generating {n_examples} examples on {split} split')
                         done = True
 
                     batch = []
@@ -714,7 +707,7 @@ def get_batch_iterator(names: List[str],
                         yield collate_fn(batch)
                         if n_examples is not None and example_idx >= n_examples:
                             if not silent:
-                                rank0_print(f'FINISHED {n_examples} EXAMPLES on {split} split')
+                                mprint(f'FINISHED {n_examples} EXAMPLES on {split} split')
                             done = True
                         batch = []
         if done:

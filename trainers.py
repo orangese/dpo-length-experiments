@@ -38,7 +38,7 @@ from utils import (
     all_gather_if_needed,
     pad_to_length,
     get_block_class_from_model,
-    rank0_print,
+    mprint,
     get_local_dir,
     upload_to_gcp
 )
@@ -137,7 +137,7 @@ class BasicTrainer(object):
             assert self.config.batch_size == self.config.eval_batch_size, "train batch size and eval batch size must be the same on xla"
 
         tokenizer_name_or_path = config.model.tokenizer_name_or_path or config.model.name_or_path
-        rank0_print(f'Loading tokenizer {tokenizer_name_or_path}')
+        mprint(f'Loading tokenizer {tokenizer_name_or_path}')
         self.tokenizer = transformers.AutoTokenizer.from_pretrained(tokenizer_name_or_path, cache_dir=get_local_dir(config.local_dirs))
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
@@ -168,18 +168,18 @@ class BasicTrainer(object):
 
         if not no_train:
             self.train_iterator = dataloader_fn(**data_iterator_kwargs, split='train', batch_size=config.batch_size, cache_dir=get_local_dir(config.local_dirs))
-            rank0_print(f'Loaded train data iterator ({config.use_tpu=})')
+            mprint(f'Loaded train data iterator ({config.use_tpu=})')
         else:
             self.train_iterator = None
-            rank0_print('Did not load train data iterator')
+            mprint('Did not load train data iterator')
 
         self.eval_iterator = dataloader_fn(**data_iterator_kwargs, split='test', batch_size=config.eval_batch_size, cache_dir=get_local_dir(config.local_dirs))
         if not config.use_tpu:
             self.eval_batches = None
-            rank0_print(f'Loaded {len(self.eval_batches)} eval batches of size {config.eval_batch_size}')
+            mprint(f'Loaded {len(self.eval_batches)} eval batches of size {config.eval_batch_size}')
         else:
             self.eval_batches = list(self.eval_iterator)
-            rank0_print(f"Did not pre-load eval batches since running with XLA data loader")
+            mprint(f"Did not pre-load eval batches since running with XLA data loader")
 
     def get_batch_samples(self, batch: Dict[str, torch.LongTensor], use_reference: bool = False) -> Tuple[str, str]:
         """Generate samples from the policy (and reference model, if doing DPO training) for the given batch of inputs."""
@@ -288,7 +288,7 @@ class BasicTrainer(object):
         random.seed(self.seed)
 
         if self.config.n_eval_model_samples < self.config.eval_batch_size:
-            rank0_print(f'Warning: n_eval_model_samples ({self.config.n_eval_model_samples}) < eval_batch_size ({self.config.eval_batch_size}). Sampling from the first complete eval batch of prompts.')
+            mprint(f'Warning: n_eval_model_samples ({self.config.n_eval_model_samples}) < eval_batch_size ({self.config.eval_batch_size}). Sampling from the first complete eval batch of prompts.')
             sample_batches = self.eval_batches[:1]
         else:
             n_sample_batches = self.config.n_eval_model_samples // self.config.eval_batch_size
@@ -313,7 +313,7 @@ class BasicTrainer(object):
     @torch.no_grad
     def do_eval(self):
         """Run evaluation on the evaluation set, gathering metrics from all processes and logging only on the master rank process."""
-        rank0_print(f'Running evaluation after {self.example_counter} train examples')
+        mprint(f'Running evaluation after {self.example_counter} train examples')
         self.policy.eval()
 
         all_eval_metrics = defaultdict(list)
@@ -337,7 +337,7 @@ class BasicTrainer(object):
  
         if self.config.sample_during_eval:
             if self.config.n_eval_model_samples < self.config.eval_batch_size:
-                rank0_print(f'Warning: n_eval_model_samples ({self.config.n_eval_model_samples}) < eval_batch_size ({self.config.eval_batch_size}). Sampling from the first complete eval batch of prompts.')
+                mprint(f'Warning: n_eval_model_samples ({self.config.n_eval_model_samples}) < eval_batch_size ({self.config.eval_batch_size}). Sampling from the first complete eval batch of prompts.')
                 sample_batches = self.eval_batches[:1]
             else:
                 n_sample_batches = self.config.n_eval_model_samples // self.config.eval_batch_size
@@ -359,11 +359,11 @@ class BasicTrainer(object):
                         reference_text_table.add_data(self.example_counter, prompt, sample)
 
         mean_eval_metrics = {k: sum(v) / len(v) for k, v in all_eval_metrics.items()}
-        rank0_print(f'eval after {self.example_counter}: {formatted_dict(mean_eval_metrics)}')
+        mprint(f'eval after {self.example_counter}: {formatted_dict(mean_eval_metrics)}')
         if self.config.sample_during_eval:                    
-            rank0_print(json.dumps(all_policy_samples[:10], indent=2))
+            mprint(json.dumps(all_policy_samples[:10], indent=2))
             if self.config.loss.name == 'dpo':
-                rank0_print(json.dumps(all_reference_samples[:10], indent=2))
+                mprint(json.dumps(all_reference_samples[:10], indent=2))
 
         if self.config.wandb.enabled and self.rank == 0:
             wandb.log(mean_eval_metrics, step=self.example_counter)
@@ -375,10 +375,10 @@ class BasicTrainer(object):
 
         if self.example_counter > 0:
             if self.config.debug:
-                rank0_print('skipping save in debug mode')
+                mprint('skipping save in debug mode')
             else:
                 output_dir = os.path.join(self.run_dir, f'step-{self.example_counter}')
-                rank0_print(f'creating checkpoint to write to {output_dir}...')
+                mprint(f'creating checkpoint to write to {output_dir}...')
                 self.save(output_dir, mean_eval_metrics)
 
     def do_train(self, batch, last_log):
@@ -413,21 +413,21 @@ class BasicTrainer(object):
             mean_train_metrics = {k: sum(v) / len(v) for k, v in batch_metrics.items()}
             mean_train_metrics['counters/examples'] = self.example_counter
             mean_train_metrics['counters/updates'] = self.batch_counter
-            rank0_print(f'train stats after {self.example_counter} examples: {formatted_dict(mean_train_metrics)}')
+            mprint(f'train stats after {self.example_counter} examples: {formatted_dict(mean_train_metrics)}')
 
             if self.config.wandb.enabled and self.rank == 0:
                 wandb.log(mean_train_metrics, step=self.example_counter)
 
             last_log = time.time()
         else:
-            rank0_print(f'skipping logging after {self.example_counter} examples to avoid logging too frequently')
+            mprint(f'skipping logging after {self.example_counter} examples to avoid logging too frequently')
 
         return last_log
 
     def train(self):
         """Begin either SFT or DPO training, with periodic evaluation."""
 
-        rank0_print(f'Using {self.config.optimizer} optimizer')
+        mprint(f'Using {self.config.optimizer} optimizer')
         self.optimizer = getattr(torch.optim, self.config.optimizer)(self.policy.parameters(), lr=self.config.lr)
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lambda step: min(1.0, (step + 1) / (self.config.warmup_steps + 1)))
     
@@ -453,12 +453,12 @@ class BasicTrainer(object):
                 last_log = self.do_train(batch, last_log)
             
                 if self.config.max_examples is not None and self.example_counter >= self.config.max_examples:
-                    rank0_print(f'reached max_examples ({self.config.max_examples}), exiting')
+                    mprint(f'reached max_examples ({self.config.max_examples}), exiting')
                     return
             
             n_epochs += 1
             if self.config.n_epochs is not None and n_epochs >= self.config.n_epochs:
-                rank0_print(f'reached n_epochs ({self.config.n_epochs}), exiting')
+                mprint(f'reached n_epochs ({self.config.n_epochs}), exiting')
                 return
 
     def clip_gradient(self):
@@ -472,7 +472,7 @@ class BasicTrainer(object):
 
         os.makedirs(dir_name, exist_ok=True)
         output_path = os.path.join(dir_name, filename)
-        rank0_print(f'writing checkpoint to {output_path}...')
+        mprint(f'writing checkpoint to {output_path}...')
 
         data = {
             'step_idx': step,
@@ -525,13 +525,13 @@ class FSDPTrainer(BasicTrainer):
             sync_module_states=False
         )
 
-        rank0_print('Sharding policy...')
+        mprint('Sharding policy...')
         mp_dtype = getattr(torch, config.model.fsdp_policy_mp) if config.model.fsdp_policy_mp is not None else None
         policy_mp_policy = MixedPrecision(param_dtype=mp_dtype, reduce_dtype=mp_dtype, buffer_dtype=mp_dtype)
         self.policy = FSDP(policy, **shared_fsdp_kwargs, mixed_precision=policy_mp_policy)
 
         if config.activation_checkpointing:
-            rank0_print('Attempting to enable activation checkpointing...')
+            mprint('Attempting to enable activation checkpointing...')
             try:
                 # use activation checkpointing, according to:
                 # https://pytorch.org/blog/scaling-multimodal-foundation-models-in-torchmultimodal-with-pytorch-distributed/
@@ -548,15 +548,15 @@ class FSDPTrainer(BasicTrainer):
                     checkpoint_impl=CheckpointImpl.NO_REENTRANT,
                 )
             except Exception as e:
-                rank0_print('FSDP activation checkpointing not available:', e)
+                mprint('FSDP activation checkpointing not available:', e)
             else:
                 check_fn = lambda submodule: isinstance(submodule, wrap_class)
-                rank0_print('Applying activation checkpointing wrapper to policy...')
+                mprint('Applying activation checkpointing wrapper to policy...')
                 apply_activation_checkpointing(self.policy, checkpoint_wrapper_fn=non_reentrant_wrapper, check_fn=check_fn)
-                rank0_print('FSDP activation checkpointing enabled!')
+                mprint('FSDP activation checkpointing enabled!')
 
         if config.loss.name == 'dpo':
-            rank0_print('Sharding reference model...')
+            mprint('Sharding reference model...')
             self.reference_model = FSDP(reference_model, **shared_fsdp_kwargs)
         
         print('Loaded model on rank', rank)
@@ -603,7 +603,7 @@ class FSDPTrainerXLA(BasicTrainer):
 
         super().__init__(policy, config, seed, run_dir, reference_model, 0, 1)
         assert config.model.block_name is not None, 'must specify model.block_name (e.g., GPT2Block or GPTNeoXLayer) for FSDP'
-        rank0_print("Initializing FSDPTrainerXLA")
+        mprint("Initializing FSDPTrainerXLA")
 
         # Move models to the proper device
         device = xm.xla_device()
@@ -621,13 +621,13 @@ class FSDPTrainerXLA(BasicTrainer):
         # Apply activation checkpointing
         auto_wrap_callable = None
         if config.activation_checkpointing:
-            rank0_print("Enabling activation checkpointing")
+            mprint("Enabling activation checkpointing")
             auto_wrap_callable = lambda m, *args, **kwargs: FSDP(
                 checkpoint_module(m), *args, **kwargs
             )
 
         # Wrap the base and reference models
-        rank0_print('Sharding policy...')
+        mprint('Sharding policy...')
         mp_dtype = None
         if config.model.fsdp_policy_mp is not None:
             mp_dtype = getattr(torch, config.model.fsdp_policy_mp)
@@ -641,7 +641,7 @@ class FSDPTrainerXLA(BasicTrainer):
         self.policy = fsdp_wrap(policy)
 
         if config.loss.name == "dpo":
-            rank0_print('Sharding reference model...')
+            mprint('Sharding reference model...')
             self.reference_model = fsdp_wrap(reference_model)
 
         print('Loaded model on rank', device)
@@ -661,7 +661,7 @@ class FSDPTrainerXLA(BasicTrainer):
     def do_eval(self):
         """Run evaluation on the evaluation set, gathering metrics from all processes and logging only on the master rank process."""
         self.policy.eval()
-        rank0_print(f'Running evaluation after {self.example_counter} train examples')
+        mprint(f'Running evaluation after {self.example_counter} train examples')
 
         all_eval_metrics = defaultdict(list)
         nb = self.config.n_eval_examples / (self.config.eval_batch_size * xm.xrt_world_size())
@@ -672,19 +672,19 @@ class FSDPTrainerXLA(BasicTrainer):
    
         for i, local_eval_batch in enumerate(eval_iter):
             if i > nb:
-                rank0_print(f"finished {i} eval batches ({self.config.n_eval_examples} examples) with batch size {self.config.batch_size}")
+                mprint(f"finished {i} eval batches ({self.config.n_eval_examples} examples) with batch size {self.config.batch_size}")
                 break
             # already sliced and moved to correct XLA device by the data loader
             _, eval_metrics = self.get_batch_metrics(local_eval_batch, self.config.loss, train=False, lazy=True)
             for k, v in eval_metrics.items():
                 all_eval_metrics[k].extend(v)
             xm.master_print(met.metrics_report())
-            xm.master_print(f"nb={nb}, {self.config.n_eval_examples=}, {self.config.eval_batch_size=}, {xm.xrt_world_size()=}")
             xm.master_print(all_eval_metrics)
+            xm.master_print(f"nb={nb}, {self.config.n_eval_examples=}, {self.config.eval_batch_size=}, {xm.xrt_world_size()=}")
 
         # now we can mesh reduce across all processes
         mean_eval_metrics = xm.mesh_reduce('eval_metrics', all_eval_metrics, FSDPTrainerXLA._reduce_dict)
-        rank0_print(f'eval after {self.example_counter}: {formatted_dict(mean_eval_metrics)}')
+        mprint(f'eval after {self.example_counter}: {formatted_dict(mean_eval_metrics)}')
 
         # log if appropriate
         if self.config.wandb.enabled and xm.is_master_ordinal(local=False):
@@ -692,10 +692,10 @@ class FSDPTrainerXLA(BasicTrainer):
 
         if self.example_counter > 0:
             if self.config.debug:
-                rank0_print('skipping save in debug mode')
+                mprint('skipping save in debug mode')
             else:
                 output_dir = os.path.join(self.run_dir, f'step-{self.example_counter}')
-                rank0_print(f'creating checkpoint to write to {output_dir}...')
+                mprint(f'creating checkpoint to write to {output_dir}...')
                 self.save(output_dir, mean_eval_metrics)
 
     def do_train(self, batch, last_log):
@@ -705,7 +705,7 @@ class FSDPTrainerXLA(BasicTrainer):
             mean_train_metrics = xm.mesh_reduce('train_metrics', batch_metrics, FSDPTrainerXLA._reduce_dict)
             mean_train_metrics['counters/examples'] = example_counter
             mean_train_metrics['counters/updates'] = batch_counter
-            rank0_print(f'[{device}] train stats after {example_counter} examples: {formatted_dict(mean_train_metrics)}')
+            mprint(f'[{device}] train stats after {example_counter} examples: {formatted_dict(mean_train_metrics)}')
 
             if wandb_enabled and xm.is_master_ordinal(local=False):
                 wandb.log(mean_train_metrics, step=example_counter)
@@ -781,7 +781,7 @@ class FSDPTrainerXLA(BasicTrainer):
                 ckpt_prefix=ckpt_prefix,
                 ckpt_suffix="_rank-*-of-*.pth"
             )
-            rank0_print(f'consolidated checkpoint saved to {ckpt_prefix}_consolidated.pth\n', end='')
+            mprint(f'consolidated checkpoint saved to {ckpt_prefix}_consolidated.pth\n', end='')
         
         xm.rendezvous('ckpt_consolidation')
 
@@ -800,7 +800,7 @@ class FSDPTrainerXLA(BasicTrainer):
         for rank in range(world_size):
             os.remove(f'{ckpt_prefix}_rank-{rank:08d}-of-{world_size:08d}.pth')
         os.remove(f'{ckpt_prefix}_consolidated.pth')
-        rank0_print(f'removed local shards and consolidated checkpoint\n', end='')
+        mprint(f'removed local shards and consolidated checkpoint\n', end='')
 
         # save optimizer and scheduler state
         optimizer_state_dict = self.optimizer.state_dict()
@@ -819,7 +819,7 @@ class FSDPTrainerXLA(BasicTrainer):
             for path in paths:
                 upload_to_gcp(path, os.path.join(save_dir, path))
                 os.remove(path)
-            rank0_print(f'uploaded consolidated checkpoints to gcp\n', end='')
+            mprint(f'uploaded consolidated checkpoints to gcp\n', end='')
 
  
 class TensorParallelTrainer(BasicTrainer):
@@ -831,10 +831,10 @@ class TensorParallelTrainer(BasicTrainer):
         """
         super().__init__(policy, config, seed, run_dir, reference_model, rank, world_size)
         
-        rank0_print('Sharding policy...')
+        mprint('Sharding policy...')
         self.policy = tp.tensor_parallel(policy, sharded=True)
         if config.loss.name == 'dpo':
-            rank0_print('Sharding reference model...')
+            mprint('Sharding reference model...')
             self.reference_model = tp.tensor_parallel(reference_model, sharded=False)
 
     def save(self, output_dir=None, metrics=None):
