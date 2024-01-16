@@ -8,6 +8,7 @@ import transformers
 
 import sys
 sys.path.insert(1, "../")
+import preference_datasets
 from preference_datasets import get_dataset
 
 tokenizer = transformers.AutoTokenizer.from_pretrained(
@@ -28,19 +29,24 @@ def get_len(text, tokenizer=tokenizer, cache=None):
     return toklen
 
 
-def plot_length(dataset, code, name, maxlen):
+def plot_length(dataset, code, name, split, maxlen):
     # Get token lengths
     results = []
-    cfile = f"cache/{name}_lens.pkl"
+    if split == "train":
+        cfile = f"cache/{name}_lens.pkl"
+    else:
+        cfile = f"cache/{name}_{split}_lens.pkl"
 
     try:
         with open(cfile, "rb") as f:
             cache = pickle.load(f)
         print(f"loaded {cfile} from cache")
+        loaded = True
     except FileNotFoundError:
         cache = {}
+        loaded = False
 
-    for completions in tqdm(dataset.values()):
+    for completions in tqdm(dataset.values(), desc=f"Tokenizing {code}"):
         for pair in completions["pairs"]:
             chosen = completions["responses"][pair[0]]
             rejected = completions["responses"][pair[1]]
@@ -51,9 +57,11 @@ def plot_length(dataset, code, name, maxlen):
             info["Length difference"] = info["Preferred length"] - info["Dispreferred length"]
             results.append(info)
 
-    with open(cfile, "wb") as f:
-        print(f"caching {cfile} for later...")
-        pickle.dump(cache, f)
+    os.makedirs(os.path.dirname(cfile), exist_ok=True)
+    if not loaded:
+        with open(cfile, "wb+") as f:
+            print(f"caching {cfile} for later...")
+            pickle.dump(cache, f)
 
     # Printing for the latex table in the paper
     results = pd.DataFrame(results)
@@ -151,21 +159,22 @@ def plot_accs(accs):
 
 
 if __name__ == "__main__":
+    preference_datasets.LOCAL_PATH = "../data/"
     split = "train"
     info = {
         # datasets from dpo paper
         "hh": ("Anthropic RLHF HH", 500),
         "shp": ("Stanford Human Preferences", 1000),
-        # "se": ("Stack Exchange Full", 10000),
+        #"se": ("Stack Exchange Full", 10000),
         "tldr": ("Webis TLDR 17", 150),
 
         # datasets from length paper
         "rlcd": ("RLCD Synthetic", 400),
         "webgpt": ("WebGPT", 400),
-        "stack": ("Stack Exchange Paired", 200),
+        #"stack": ("Stack Exchange Paired", 200),
 
         # other datasets
-        # TODO: https://huggingface.co/datasets/openbmb/UltraFeedback/viewer/default/train?row=4
+        "ultrafeedback": ("Ultrafeedback Preferences", 10000),
         "alpaca": ("AlpacaFarm", 500),
     }
 
@@ -178,8 +187,9 @@ if __name__ == "__main__":
 
     for ds_code in info:
         ds = get_dataset(ds_code, split)
+        print(f"{ds_code}: {split=}, n_examples={len(ds)}")
         name, maxlen = info[ds_code]
-        table, acc = plot_length(ds, ds_code, name, maxlen)
+        table, acc = plot_length(ds, ds_code, name, split, maxlen)
         table_texts.append(table)
         accs[ds_code] = acc
 
