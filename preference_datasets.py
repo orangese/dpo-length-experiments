@@ -406,7 +406,6 @@ def _collate_fn(batch, tokenizer, max_length=None) -> Dict[str, Union[List, torc
     # then, concatenate the chosen and rejected inputs into a single tensor
     if max_length is None:  # for xla, specify max len to avoid unnecessary recompiles
         max_length = max(padded_batch['chosen_input_ids'].shape[1], padded_batch['rejected_input_ids'].shape[1])
-    rank0_print(f"using max length = {max_length}")
     for k in list(padded_batch.keys()):
         if k.startswith('chosen') and isinstance(padded_batch[k], torch.Tensor):
             pad_value = -100 if 'labels' in k else 0

@@ -59,8 +59,8 @@ def dpo_loss(policy_chosen_logps: torch.FloatTensor,
              policy_rejected_logps: torch.FloatTensor,
              reference_chosen_logps: torch.FloatTensor,
              reference_rejected_logps: torch.FloatTensor,
-             beta: torch.FloatTensor,
-             alpha: torch.FloatTensor,
+             beta: float,
+             alpha: float,
              chosen_len: torch.FloatTensor,
              rejected_len: torch.FloatTensor,
              reference_free: bool = False) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
@@ -86,13 +86,13 @@ def dpo_loss(policy_chosen_logps: torch.FloatTensor,
     ref_logratios = reference_chosen_logps - reference_rejected_logps
 
     logits = pi_logratios - ref_logratios
-    unscaled = beta * logits - alpha * rejected_len - alpha * chosen_len
+    unscaled = beta * logits - alpha * chosen_len + alpha * rejected_len
 
     losses = -F.logsigmoid(unscaled)
-    chosen_rewards = beta * (policy_chosen_logps - reference_chosen_logps).detach()
-    rejected_rewards = beta * (policy_rejected_logps - reference_rejected_logps).detach()
+#    chosen_rewards = beta * (policy_chosen_logps - reference_chosen_logps).detach()
+#    rejected_rewards = beta * (policy_rejected_logps - reference_rejected_logps).detach()
 
-    return losses, chosen_rewards, rejected_rewards
+    return losses#losses, chosen_rewards, rejected_rewards
 
 
 def _get_batch_logps(logits: torch.FloatTensor, labels: torch.LongTensor, average_log_prob: bool = False) -> torch.FloatTensor:
@@ -153,6 +153,8 @@ class BasicTrainer(object):
 
         self.policy = policy
         self.reference_model = reference_model
+        self.example_counter = 0
+        self.batch_counter = 0
         
         dataloader_fn = get_batch_iterator
         data_iterator_kwargs["silent"] = rank != 0
@@ -225,21 +227,40 @@ class BasicTrainer(object):
         metrics = {}
         train_test = 'train' if train else 'eval'
 
+        if loss_config.name != "dpo": raise NotImplementedError
+
+        policy_chosen, policy_rejected = self.concatenated_forward(self.policy, batch)
+        with torch.no_grad():
+            ref_chosen, ref_rejected = self.concatenated_forward(self.reference_model, batch)
+
+        losses = dpo_loss(#, chosen, rejected = dpo_loss(
+            policy_chosen,
+            policy_rejected,
+            ref_chosen,
+            ref_rejected,
+            beta=loss_config.beta,
+            alpha=loss_config.alpha,
+            chosen_len=batch["chosen_len"],
+            rejected_len=batch["rejected_len"],
+            reference_free=loss_config.reference_free
+        )
+        metrics = {}
+        return losses.mean(), metrics
+
         if loss_config.name == 'dpo':
             policy_chosen_logps, policy_rejected_logps = self.concatenated_forward(self.policy, batch)
             with torch.no_grad():
                 reference_chosen_logps, reference_rejected_logps = self.concatenated_forward(self.reference_model, batch)
 
             losses, chosen_rewards, rejected_rewards = dpo_loss(
-                policy_chosen_logps, policy_rejected_logps, reference_chosen_logps, reference_rejected_logps,
+                policy_chosen_logps, policy_rejected_logps,
+                reference_chosen_logps, reference_rejected_logps,
                 beta=loss_config.beta,
                 alpha=loss_config.alpha,
-                reference_free=loss_config.reference_free,
                 chosen_len=batch["chosen_len"],
-                rejected_len=batch["rejected_len"]
+                rejected_len=batch["rejected_len"],
+                reference_free=loss_config.reference_free
             )
-            chosen_rewards = chosen_rewards.detach()
-            rejected_rewards = rejected_rewards.detach()
             reward_accuracies = (chosen_rewards > rejected_rewards).float()
 
             if not lazy:
@@ -273,12 +294,16 @@ class BasicTrainer(object):
             losses_view = all_gather_if_needed(losses_view, self.rank, self.world_size)
         metrics[f'loss/{train_test}'] = losses_view
  
-        if not lazy:
+        #if not lazy:
             # do NOT execute with XLA! no native lowering implemented, will use xla->cpu callback
             # unsure if detach() is even a good idea with xla?
-            for k, v in metrics.items():
-                metrics[k] = v.cpu().numpy().tolist()
-
+        for k, v in metrics.items():
+            metrics[k] = v.cpu().numpy().tolist()
+        #else:
+            # early reduce mean in graph for xla for convenience, this should not force eager eval
+            #for k, v in metrics.items():
+                #metrics[k] = v.mean()
+       
         return losses.mean(), metrics
 
     def sample(self, n_per=10):
@@ -452,8 +477,8 @@ class BasicTrainer(object):
                     self.do_eval()
                 last_log = self.do_train(batch, last_log)
             
-                if self.config.max_examples is not None and self.example_counter >= self.config.max_examples:
-                    rank0_print(f'reached max_examples ({self.config.max_examples}), exiting')
+                if self.config.n_examples is not None and self.example_counter >= self.config.n_examples:
+                    rank0_print(f'reached n_examples ({self.config.n_examples}), exiting')
                     return
             
             n_epochs += 1
@@ -605,11 +630,15 @@ class FSDPTrainerXLA(BasicTrainer):
         assert config.model.block_name is not None, 'must specify model.block_name (e.g., GPT2Block or GPTNeoXLayer) for FSDP'
         rank0_print("Initializing FSDPTrainerXLA")
 
+        assert self.config.batch_size % self.config.gradient_accumulation_steps == 0, "batch size must be divisible by grad accumulation steps"
+        #assert self.config.batch_size // self.config.gradient_accumulation_steps >= 8, "smallest possible microbatch is 8 on TPU"
+
         # Move models to the proper device
         device = xm.xla_device()
         policy = policy.to(device)
         if reference_model:
             reference_model = reference_model.to(device)
+            reference_model.eval()
 
         # Wrap submodules with FSDP too (zero 3)
         wrap_class = get_block_class_from_model(policy, config.model.block_name)
@@ -636,7 +665,9 @@ class FSDPTrainerXLA(BasicTrainer):
             m,
             compute_dtype=mp_dtype,
             auto_wrap_policy=auto_wrap_policy,
-            auto_wrapper_callable=auto_wrap_callable
+            auto_wrapper_callable=auto_wrap_callable,
+            #pin_layout_in_collective_ops=False
+            # otherwise gradient clipping doesn't work strangely (zero division error)
         )
         self.policy = fsdp_wrap(policy)
 
@@ -645,17 +676,25 @@ class FSDPTrainerXLA(BasicTrainer):
             self.reference_model = fsdp_wrap(reference_model)
 
         print('Loaded model on rank', device)
+        #if not config.do_first_eval:
+        #    xm.master_print("SAVING MODEL")
+        #    self.save()
+        #    xm.master_print("SAVED MODEL")
     
     @staticmethod
     def _reduce_dict(dict_list):
         """Given list of dicts with same key sets, reduces into one dict by taking the 
-        average over each key. Each key in each dict will map to a 1-D tensor of values."""
+        average over each key. Each key in each dict will map to a list of 1-D tensors."""
         result = {}
         for k in dict_list[0].keys():
             result[k] = 0
             for d in dict_list:
-                result[k] += d[k].mean()
-        return {k: v.item() / len(dict_list) for k, v in result.items()}
+                try:
+                    result[k] += sum([tensor.mean().item() for tensor in d[k]]) / len(d[k])
+                except AttributeError:
+                    result[k] += sum(d[k]) / len(d[k])
+            result[k] /= len(dict_list)
+        return result
 
     @torch.no_grad
     def do_eval(self):
@@ -677,12 +716,12 @@ class FSDPTrainerXLA(BasicTrainer):
             # already sliced and moved to correct XLA device by the data loader
             _, eval_metrics = self.get_batch_metrics(local_eval_batch, self.config.loss, train=False, lazy=True)
             for k, v in eval_metrics.items():
-                all_eval_metrics[k].extend(v)
+                all_eval_metrics[k].append(v)
             xm.master_print(met.metrics_report())
             xm.master_print(f"nb={nb}, {self.config.n_eval_examples=}, {self.config.eval_batch_size=}, {xm.xrt_world_size()=}")
-            xm.master_print(all_eval_metrics)
 
         # now we can mesh reduce across all processes
+        print(all_eval_metrics)
         mean_eval_metrics = xm.mesh_reduce('eval_metrics', all_eval_metrics, FSDPTrainerXLA._reduce_dict)
         rank0_print(f'eval after {self.example_counter}: {formatted_dict(mean_eval_metrics)}')
 
@@ -696,7 +735,7 @@ class FSDPTrainerXLA(BasicTrainer):
             else:
                 output_dir = os.path.join(self.run_dir, f'step-{self.example_counter}')
                 rank0_print(f'creating checkpoint to write to {output_dir}...')
-                self.save(output_dir, mean_eval_metrics)
+                #self.save(output_dir, mean_eval_metrics)
 
     def do_train(self, batch, last_log):
         """Perform one training step on batch, FSDP."""
@@ -705,37 +744,29 @@ class FSDPTrainerXLA(BasicTrainer):
             mean_train_metrics = xm.mesh_reduce('train_metrics', batch_metrics, FSDPTrainerXLA._reduce_dict)
             mean_train_metrics['counters/examples'] = example_counter
             mean_train_metrics['counters/updates'] = batch_counter
-            rank0_print(f'[{device}] train stats after {example_counter} examples: {formatted_dict(mean_train_metrics)}')
+            xm.master_print(f'[{device}] train stats after {example_counter} examples: {formatted_dict(mean_train_metrics)}')
 
             if wandb_enabled and xm.is_master_ordinal(local=False):
                 wandb.log(mean_train_metrics, step=example_counter)
 
         self.policy.train()
+        
         start_time = time.time()
         batch_metrics = defaultdict(list)
 
-        chunk_size = self.config.batch_size // self.config.gradient_accumulation_steps
-        for idx in range(self.config.gradient_accumulation_steps):
-            # No need to slice the batch for device movement, since it's already on the correct XLA device
-            # Slicing is solely for the purpose of gradient accumulation here
-            end = (idx + 1) * chunk_size
-            if self.config.batch_size - end < chunk_size:
-                end = self.config.batch_size
-
-            microbatch = {k: v[slice(idx * chunk_size, end)] for k, v in batch.items()}
-            loss, metrics_microbatch = self.get_batch_metrics(microbatch, self.config.loss, train=True, lazy=True)
-            (loss / self.config.gradient_accumulation_steps).backward()
-
-            for k, v in metrics_microbatch.items():
-                batch_metrics[k].append(v)
+        loss, m = self.get_batch_metrics(batch, self.config.loss, train=True, lazy=True)
+        for k, v in m.items():
+            batch_metrics[k].append(v)
+        loss.backward()
 
         # clip gradients and update parameters
         # (do not record gradient norm since it requires explicit access of intermediate tensor via item()
         # which doesn't have a native XLA translation)
-        self.clip_gradient()
+        #self.clip_gradient()  # TODO: figure out why this is broken
         self.optimizer.step()
         self.scheduler.step()
         self.optimizer.zero_grad()
+        #xm.master_print(met.metrics_report())
 
         # gather metrics and log them
         step_time = time.time() - start_time
@@ -747,10 +778,11 @@ class FSDPTrainerXLA(BasicTrainer):
 
         # should use add_step_closure so that performance doesn't take a hit from accessing intermediate tensors
         if last_log is None or time.time() - last_log > self.config.minimum_log_interval_secs:
-            xm.add_step_closure(
-                log_train_metrics,
-                args=(xm.xla_device(), self.example_counter, self.batch_counter, batch_metrics, self.config.wandb.enabled),
-            )
+            xm.master_print(f"done last examples, n={self.example_counter}, took {time.time() - start_time}s")
+            #xm.add_step_closure(
+            #    log_train_metrics,
+            #    args=(xm.xla_device(), self.example_counter, self.batch_counter, batch_metrics, self.config.wandb.enabled),
+            #)
             last_log = time.time()
 
         return last_log
@@ -761,6 +793,12 @@ class FSDPTrainerXLA(BasicTrainer):
 
     def save(self, output_dir=None, metrics=None):
         """Save policy, optimizer, and scheduler state to disk."""
+        if output_dir is None:
+            output_dir = os.path.join(self.run_dir, f'LATEST')
+        
+        cachedir = get_local_dir(self.config.local_dirs)
+        assert cachedir in output_dir, f"cache {cachedir} must be in output dir {output_dir} for gcp saving"
+
         # Save model checkpoint
         rank = xm.get_ordinal()
         world_size = xm.xrt_world_size()
@@ -773,53 +811,26 @@ class FSDPTrainerXLA(BasicTrainer):
         }
         os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
         xm.save(ckpt, ckpt_path, master_only=False)
+        del ckpt
+
         print(f'checkpoint saved to {ckpt_path}\n', end='')
 
-         # Consolidate the sharded model checkpoints
-        if xm.is_master_ordinal(local=False):
-            consolidate_sharded_model_checkpoints(
-                ckpt_prefix=ckpt_prefix,
-                ckpt_suffix="_rank-*-of-*.pth"
-            )
-            rank0_print(f'consolidated checkpoint saved to {ckpt_prefix}_consolidated.pth\n', end='')
-        
-        xm.rendezvous('ckpt_consolidation')
+        save_path = ckpt_path.replace(cachedir, os.path.join(self.config.gcp_bucket, "runs"))
+        upload_to_gcp(ckpt_path, save_path)
+        os.remove(ckpt_path)
+        print(f"uploaded {ckpt_path} to {save_path}, deleted locally")
+        xm.rendezvous("save_ckpts")
 
-        # Fix formats and upload to GCP on master process
-        if xm.is_master_ordinal(local=False):
-            self.coerce_ckpt_format(ckpt_prefix, metrics, output_dir)
-    
-    def coerce_ckpt_format(self, ckpt_prefix, metrics, output_dir):
-        # format consolidated checkpoint to match original format
-        ckpt = torch.load(f"{ckpt_prefix}_consolidated.pth", map_location="cpu")
-        self.write_state_dict(self.example_counter, ckpt["model"], metrics, 'policy.pt', output_dir)
-        del ckpt
-    
-        # remove the sharded checkpoints and consolidated checkpoint
-        world_size = xm.xrt_world_size()
-        for rank in range(world_size):
-            os.remove(f'{ckpt_prefix}_rank-{rank:08d}-of-{world_size:08d}.pth')
-        os.remove(f'{ckpt_prefix}_consolidated.pth')
-        rank0_print(f'removed local shards and consolidated checkpoint\n', end='')
+        # save optimizer and scheduler state on master process only
+        # TODO: all reduce optimizer across different processes
 
-        # save optimizer and scheduler state
-        optimizer_state_dict = self.optimizer.state_dict()
-        self.write_state_dict(self.example_counter, optimizer_state_dict, metrics, 'optimizer.pt', output_dir)
-        del optimizer_state_dict
+        #optimizer_state_dict = self.optimizer.state_dict()
+        #self.write_state_dict(self.example_counter, optimizer_state_dict, metrics, 'optimizer.pt', output_dir)
+        #del optimizer_state_dict
 
-        scheduler_state_dict = self.scheduler.state_dict()
-        self.write_state_dict(self.example_counter, scheduler_state_dict, metrics, 'scheduler.pt', output_dir)
-        del scheduler_state_dict
-
-        # upload to gcp if available
-        if self.config.gcp_bucket is not None:
-            paths = [os.path.join(output_dir, f) for f in ["policy.pt", "optimizer.pt", "scheduler.pt"]]
-            cache_dir = get_local_dir(self.config.local_dirs)
-            save_dir = output_dir.replace(cache_dir, os.path.join(self.config.gcp_bucket, "runs"))
-            for path in paths:
-                upload_to_gcp(path, os.path.join(save_dir, path))
-                os.remove(path)
-            rank0_print(f'uploaded consolidated checkpoints to gcp\n', end='')
+        #scheduler_state_dict = self.scheduler.state_dict()
+        #self.write_state_dict(self.example_counter, scheduler_state_dict, metrics, 'scheduler.pt', output_dir)
+        #del scheduler_state_dict
 
  
 class TensorParallelTrainer(BasicTrainer):
