@@ -20,6 +20,8 @@ try:
 except (ModuleNotFoundError, ImportError):
     mprint("WARNING: torch_xla not found")
 
+LOCAL_PATH = "data/"
+
 
 def extract_anthropic_prompt(prompt_and_response):
     """Extract the anthropic prompt from a prompt and response pair."""
@@ -153,6 +155,7 @@ def get_shp(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str
 
 def get_webgpt(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str, Dict[str, Union[List[Tuple[int, int]], List[str], str]]]:
     mprint(f'Loading WebGPT dataset ({split}) from Huggingface...')
+    split = "train[0%:90%]" if split == "train" else "train[90%:]"
     dataset = load_dataset("openai/webgpt_comparisons", split=split, cache_dir=cache_dir)
 
     def split_prompt_and_responses(row):
@@ -173,7 +176,7 @@ def get_webgpt(split: str, silent: bool = False, cache_dir: str = None) -> Dict[
         data[prompt]['responses'].extend(responses)
         data[prompt]['sft_target'] = chosen
 
-    return data    
+    return data
 
 
 def get_rlcd(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str, Dict[str, Union[List[Tuple[int, int]], List[str], str]]]:
@@ -200,13 +203,14 @@ def get_rlcd(split: str, silent: bool = False, cache_dir: str = None) -> Dict[st
         data[prompt]['responses'].extend(responses)
         data[prompt]['sft_target'] = chosen
 
-    return data    
+    return data 
 
 
 def get_alpaca(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str, Dict[str, Union[List[Tuple[int, int]], List[str], str]]]:
     """Load the AlpacaFarm dataset."""
     mprint(f'Loading AlpacaFarm dataset (split=all, ignoring arg) locally...')
-    with open(os.path.join("data/farm/alpaca_human_preference.json"), 'r') as f:
+    datapath = os.path.join(LOCAL_PATH, "farm/alpaca_human_preference.json")
+    with open(os.path.join(datapath), 'r') as f:
         dataset = json.load(f)
 
     def split_prompt_and_responses(row):
@@ -250,35 +254,31 @@ def get_stack(split: str, silent: bool = False, cache_dir: str = None) -> Dict[s
     return data
 
 
-def load_tldr(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str, Dict[str, Union[List[Tuple[int, int]], List[str], str]]]:
-    datapath = "data/tldr/comparisons"
+def get_tldr(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str, Dict[str, Union[List[Tuple[int, int]], List[str], str]]]:
+    datapath = os.path.join(LOCAL_PATH, "tldr/comparisons")
 
     mprint(f"Loading TLDR dataset from {datapath} with '{split}' split, locally...")
     tldr = []
-    train_re = r"batch([3-9]|10)\.json"
+    split = "valid2" if split == "test" or split == "val" else "train"
 
     for f in os.listdir(datapath):
-        if not f.endswith(".json"):
-            continue
-        elif split == "train" and not re.match(train_re, f):
-            continue
-        elif split == "test" and re.match(train_re, f):
+        if not f.endswith(".json") or re.match(r"batch\d+\.json", f) is None:
             continue
         f = os.path.join(datapath, f)
 
         with open(f, "r") as fobj:
             for jline in fobj.readlines():
                 sample = json.loads(jline)
-
                 prompt = sample["info"]["post"]
                 y1 = sample["summaries"][0]["text"]
                 y2 = sample["summaries"][1]["text"]
 
-                tldr.append({
-                    "prompt": prompt,
-                    "chosen": y1 if sample["choice"] == 0 else y2,
-                    "rejected": y2 if sample["choice"] == 0 else y1
-                })
+                if sample["split"] == split:
+                    tldr.append({
+                        "prompt": prompt,
+                        "chosen": y1 if sample["choice"] == 0 else y2,
+                        "rejected": y2 if sample["choice"] == 0 else y1
+                    })
     mprint("done")
 
     def split_prompt_and_responses(row):
@@ -288,6 +288,29 @@ def load_tldr(split: str, silent: bool = False, cache_dir: str = None) -> Dict[s
 
     data = defaultdict(lambda: defaultdict(list))
     for row in tqdm.tqdm(tldr, desc='Processing TLDR', disable=silent):
+        prompt, chosen, rejected = split_prompt_and_responses(row)
+        responses = [chosen, rejected]
+        n_responses = len(data[prompt]['responses'])
+        data[prompt]['pairs'].append((n_responses, n_responses + 1))
+        data[prompt]['responses'].extend(responses)
+        data[prompt]['sft_target'] = chosen
+
+    return data
+
+
+def get_ultrafeedback(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str, Dict[str, Union[List[Tuple[int, int]], List[str], str]]]:
+    mprint(f'Loading UltraFeedback dataset ({split} split) from Huggingface...')
+    split = "train_prefs" if split == "train" else "test_prefs"
+    dataset = load_dataset("HuggingFaceH4/ultrafeedback_binarized", split=split, cache_dir=cache_dir)
+
+    def split_prompt_and_responses(ex):
+        prompt = ex["prompt"]
+        chosen = ex["chosen"][1]["content"]
+        rejected = ex["rejected"][1]["content"]
+        return prompt, chosen, rejected
+
+    data = defaultdict(lambda: defaultdict(list))
+    for row in tqdm.tqdm(dataset, desc='Processing Ultrafeedback (prefs)', disable=silent):
         prompt, chosen, rejected = split_prompt_and_responses(row)
         responses = [chosen, rejected]
         n_responses = len(data[prompt]['responses'])
@@ -357,7 +380,9 @@ def get_dataset(name: str, split: str, silent: bool = False, cache_dir: str = No
     elif name == "stack":
         data = get_stack(split, silent=silent, cache_dir=cache_dir)
     elif name == "tldr":
-        data = load_tldr(split, silent=silent, cache_dir=cache_dir)
+        data = get_tldr(split, silent=silent, cache_dir=cache_dir)
+    elif name == "ultrafeedback":
+        data = get_ultrafeedback(split, silent=silent, cache_dir=cache_dir)
     else:
         raise ValueError(f"Unknown dataset '{name}'")
 
