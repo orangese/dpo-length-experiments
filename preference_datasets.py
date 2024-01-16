@@ -123,9 +123,9 @@ def get_shp(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str
 
 
 def get_webgpt(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str, Dict[str, Union[List[Tuple[int, int]], List[str], str]]]:
-    mprint(f'Loading WebGPT dataset ({split}) from Huggingface...')
+    print(f'Loading WebGPT dataset ({split}) from Huggingface...')
     split = "train[0%:90%]" if split == "train" else "train[90%:]"
-    dataset = load_dataset("openai/webgpt_comparisons", split=split, cache_dir=cache_dir)
+    dataset = datasets.load_dataset("openai/webgpt_comparisons", split=split, cache_dir=cache_dir)
 
     def split_prompt_and_responses(row):
         prompt = row["question"]["full_text"]
@@ -178,7 +178,7 @@ def get_rlcd(split: str, silent: bool = False, cache_dir: str = None) -> Dict[st
 
 def get_alpaca(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str, Dict[str, Union[List[Tuple[int, int]], List[str], str]]]:
     """Load the AlpacaFarm dataset."""
-    mprint(f'Loading AlpacaFarm dataset (split=all, ignoring arg) locally...')
+    print(f'Loading AlpacaFarm dataset (split=all, ignoring arg) locally...')
     datapath = os.path.join(LOCAL_PATH, "farm/alpaca_human_preference.json")
     with open(os.path.join(datapath), 'r') as f:
         dataset = json.load(f)
@@ -251,7 +251,7 @@ def get_tldr(split: str, silent: bool = False, cache_dir: str = None) -> Dict[st
                         "chosen": y1 if sample["choice"] == 0 else y2,
                         "rejected": y2 if sample["choice"] == 0 else y1
                     })
-    mprint("done")
+    print("done")
 
     def split_prompt_and_responses(row):
         prompt = row["prompt"]
@@ -271,9 +271,9 @@ def get_tldr(split: str, silent: bool = False, cache_dir: str = None) -> Dict[st
 
 
 def get_ultrafeedback(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str, Dict[str, Union[List[Tuple[int, int]], List[str], str]]]:
-    mprint(f'Loading UltraFeedback dataset ({split} split) from Huggingface...')
+    print(f'Loading UltraFeedback dataset ({split} split) from Huggingface...')
     split = "train_prefs" if split == "train" else "test_prefs"
-    dataset = load_dataset("HuggingFaceH4/ultrafeedback_binarized", split=split, cache_dir=cache_dir)
+    dataset = datasets.load_dataset("HuggingFaceH4/ultrafeedback_binarized", split=split, cache_dir=cache_dir)
 
     def split_prompt_and_responses(ex):
         prompt = ex["prompt"]
