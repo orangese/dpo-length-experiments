@@ -3,6 +3,7 @@ torch.backends.cuda.matmul.allow_tf32 = True
 import torch.nn.functional as F
 import torch.nn as nn
 import transformers
+import pandas as pd
 from omegaconf import DictConfig
 
 import torch.distributed as dist
@@ -272,6 +273,57 @@ class BasicTrainer(object):
         metrics[f'loss/{train_test}'] = all_devices_losses.cpu().numpy().tolist()
 
         return losses.mean(), metrics
+    
+    def get_rewards(self):
+        """Gets rewards under the policy and reference model for eval set. Only works with BasicTrainer."""
+        torch.manual_seed(self.seed)
+        np.random.seed(self.seed)
+        random.seed(self.seed)
+
+        if self.config.n_eval_model_samples < self.config.eval_batch_size:
+            rank0_print(f'Warning: n_eval_model_samples ({self.config.n_eval_model_samples}) < eval_batch_size ({self.config.eval_batch_size}). Sampling from the first complete eval batch of prompts.')
+            sample_batches = self.eval_batches[:1]
+        else:
+            n_sample_batches = self.config.n_eval_model_samples // self.config.eval_batch_size
+            sample_batches = self.eval_batches[:n_sample_batches]
+
+        results = []
+        self.policy.eval()
+
+        for eval_batch in (tqdm.tqdm(sample_batches, desc='Computing rewards...')):
+            local_eval_batch = slice_and_move_batch_for_device(eval_batch, self.rank, self.world_size, self.rank)
+            with torch.no_grad():
+                policy_chosen_logps, policy_rejected_logps = self.concatenated_forward(self.policy, local_eval_batch)
+                reference_chosen_logps, reference_rejected_logps = self.concatenated_forward(self.reference_model, local_eval_batch)
+
+                _, chosen_rewards, rejected_rewards = dpo_loss(
+                    policy_chosen_logps, policy_rejected_logps, reference_chosen_logps, reference_rejected_logps,
+                    beta=self.config.loss.beta,
+                    alpha=self.config.loss.alpha,
+                    reference_free=self.config.loss.reference_free,
+                    chosen_len=local_eval_batch["chosen_len"],
+                    rejected_len=local_eval_batch["rejected_len"]
+                )
+                results.append({
+                    "type": "chosen",
+                    "prompt": local_eval_batch["prompt"],
+                    "response": local_eval_batch["chosen_response_only"], 
+                    "policy_logps": policy_chosen_logps.cpu().numpy().tolist(),
+                    "reference_logps": reference_chosen_logps.cpu().numpy().tolist(),
+                    "rewards": chosen_rewards.cpu().numpy().tolist(),
+                    "lengths": local_eval_batch["chosen_len"].cpu().numpy().tolist()
+                })
+                results.append({
+                    "type": "rejected",
+                    "prompt": local_eval_batch["prompt"],
+                    "response": local_eval_batch["rejected_response_only"], 
+                    "policy_logps": policy_rejected_logps.cpu().numpy().tolist(),
+                    "reference_logps": reference_rejected_logps.cpu().numpy().tolist(),
+                    "rewards": rejected_rewards.cpu().numpy().tolist(),
+                    "lengths": local_eval_batch["rejected_len"].cpu().numpy().tolist()
+                })
+            
+        return pd.DataFrame(results)
 
     def sample(self, n_per=10):
         """Samples from self.policy over the evaluation set. Bootstraps n_per samples per prompt."""

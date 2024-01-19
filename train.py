@@ -30,6 +30,17 @@ def worker_sample(rank: int, world_size: int, config: DictConfig, policy: nn.Mod
     print(f'Saved samples on {len(to_save)} eval prompts to {config.sample_path}')
 
 
+def worker_rewards(rank: int, world_size: int, config: DictConfig, policy: nn.Module, reference_model: nn.Module):
+    """Gets rewards from model (only BasicTrainer supported)."""
+    TrainerClass = getattr(trainers, config.trainer)
+    print(f'Creating trainer on process {rank} with world size {world_size}')
+    trainer = TrainerClass(policy, config, config.seed, config.local_run_dir, reference_model=reference_model, rank=rank, world_size=world_size)
+
+    to_save = trainer.get_rewards()
+    to_save.to_csv(config.rewards_save_path, index=False)
+    print(f'Saved rewards on {len(to_save)} eval prompts to {config.sample_path}')
+
+
 def worker_main(rank: int, world_size: int, config: DictConfig, policy: nn.Module, reference_model: Optional[nn.Module] = None):
     """Main function for each worker process (may be only 1 for BasicTrainer/TensorParallelTrainer)."""
     if 'FSDP' in config.trainer:
@@ -117,6 +128,11 @@ def main(config: DictConfig):
     if config.sample_only:
         print(f'not training, just sampling (saving to {config.sample_path})')
         worker_sample(0, 1, config, policy)
+        return
+    
+    if config.get_rewards_only:
+        print(f'not training, just getting rewards (saving to {config.sample_path})')
+        worker_rewards(0, 1, config, policy, reference_model)
         return
     
     if 'FSDP' in config.trainer:
