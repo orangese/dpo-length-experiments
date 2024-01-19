@@ -13,19 +13,19 @@ from preference_datasets import get_dataset
 
 DATASETS = {
     # datasets from dpo paper
-    #"hh": ("Anthropic RLHF HH", 500),
+    "hh": ("Anthropic RLHF HH", 500),
     "shp": ("Stanford Human Preferences", 1000),
     #"se": ("Stack Exchange Full", 10000),
-    #"tldr": ("Webis TLDR 17", 150),
+    "tldr": ("Webis TLDR 17", 150),
 
     # datasets from length paper
-    #"rlcd": ("RLCD Synthetic", 400),
-    #"webgpt": ("WebGPT", 400),
+    "rlcd": ("RLCD Synthetic", 400),
+    "webgpt": ("WebGPT", 400),
     #"stack": ("Stack Exchange Paired", 200),
 
     # other datasets
-    #"ultrafeedback": ("Ultrafeedback Preferences", 10000),
-    #"alpaca": ("AlpacaFarm", 500),
+    "ultrafeedback": ("Ultrafeedback Preferences", 10000),
+    "alpaca": ("AlpacaFarm", 500),
 }
 
 
@@ -209,3 +209,4 @@ if __name__ == "__main__":
     print({k: round(sum(v) / len(v), 3) for k, v in accs.items()})
 
     plot_accs(accs)
+

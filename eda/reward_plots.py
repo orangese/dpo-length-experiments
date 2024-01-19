@@ -1,5 +1,6 @@
 import os
 import argparse
+import random
 import torch
 import json
 import transformers
@@ -37,8 +38,8 @@ def logps(model, tokens):
     return logps_
 
 
-def get_rewards(ds, sft_model, base_model, mod_model, tok, beta, local_cache_dir):
-    for entry in tqdm(ds[:100]):
+def get_rewards(ds, sft_model, base_model, mod_model, tok, beta, local_cache_dir, ds_name):
+    for entry in tqdm(ds):
         chosen_tokens = tok(entry["Dispreferred completion"], add_special_tokens=False)["input_ids"]
         chosen_tokens = torch.LongTensor([chosen_tokens + [tok.eos_token_id]])
 
@@ -57,11 +58,15 @@ def get_rewards(ds, sft_model, base_model, mod_model, tok, beta, local_cache_dir
         mod_rejected_logps = logps(mod_model, rejected_tokens)
     
         # Compute the implicit rewards for both models
-        entry["base_chosen_rewards"] = beta * (base_chosen_logps - sft_chosen_logps)
-        entry["base_rejected_rewards"] = beta * (base_rejected_logps - sft_rejected_logps)
+        entry["base_chosen_rewards"] = beta * (base_chosen_logps - sft_chosen_logps).item()
+        entry["base_rejected_rewards"] = beta * (base_rejected_logps - sft_rejected_logps).item()
  
-        entry["mod_chosen_rewards"] = beta * (mod_chosen_logps - sft_chosen_logps)
-        entry["mod_rejected_rewards"] = beta * (mod_rejected_logps - sft_rejected_logps)
+        entry["mod_chosen_rewards"] = beta * (mod_chosen_logps - sft_chosen_logps).item()
+        entry["mod_rejected_rewards"] = beta * (mod_rejected_logps - sft_rejected_logps).item()
+
+    # Save everything
+    dataset = pd.DataFrame()
+    dataset.to_csv(os.path.join(local_cache_dir, f"{ds_name}_{beta}_rewards.csv"))
 
 
 def plot_rewards(dataset, name, plot="concat"):
@@ -160,18 +165,17 @@ if __name__ == "__main__":
     parser.add_argument('--beta', type=float, default=0.01)
     parser.add_argument('--cache_dir', type=str, default='~/.cache')
     parser.add_argument('--local_cache_dir', type=str, default='cache')
+    parser.add_argument('--n', type=int, default=1000)
     args = parser.parse_args()
-
-    data = pd.read_csv("pythia29_preds.csv")[:100]
-    plot_rewards(data, "HH")
-    raise Exception("done")
 
     print(f"loading tokenizer {args.name_or_path}")
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         args.name_or_path,
         cache_dir=args.cache_dir
     )
-    dataset, dataset_lens = get_lens(args.dataset, tokenizer, 'train', include_completions=True)
+    dataset, dataset_lens = get_lens(args.dataset, tokenizer, 'test', include_completions=True)
+    random.shuffle(dataset_lens)
+    dataset_lens = dataset_lens[:args.n]
 
     print(f"loading sft model weights from {args.sft_archive}")
     sft_model = load_model(args.name_or_path, args.cache_dir, args.sft_archive)
@@ -183,7 +187,5 @@ if __name__ == "__main__":
     mod_model = load_model(args.name_or_path, args.cache_dir, args.mod_archive)
 
     with torch.no_grad():
-        get_rewards(dataset_lens, sft_model, base_model, mod_model, tokenizer, args.beta, args.local_cache_dir)
+        get_rewards(dataset_lens, sft_model, base_model, mod_model, tokenizer, args.beta, args.local_cache_dir, args.dataset)
 
-    print("plotting now...")
-    plot_rewards(dataset_lens, args.dataset)
