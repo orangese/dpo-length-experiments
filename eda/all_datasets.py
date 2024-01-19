@@ -11,12 +11,25 @@ sys.path.insert(1, "../")
 import preference_datasets
 from preference_datasets import get_dataset
 
-tokenizer = transformers.AutoTokenizer.from_pretrained(
-    "EleutherAI/pythia-2.8b"
-)
+DATASETS = {
+    # datasets from dpo paper
+    #"hh": ("Anthropic RLHF HH", 500),
+    "shp": ("Stanford Human Preferences", 1000),
+    #"se": ("Stack Exchange Full", 10000),
+    #"tldr": ("Webis TLDR 17", 150),
+
+    # datasets from length paper
+    #"rlcd": ("RLCD Synthetic", 400),
+    #"webgpt": ("WebGPT", 400),
+    #"stack": ("Stack Exchange Paired", 200),
+
+    # other datasets
+    #"ultrafeedback": ("Ultrafeedback Preferences", 10000),
+    #"alpaca": ("AlpacaFarm", 500),
+}
 
 
-def get_len(text, tokenizer=tokenizer, cache=None):
+def get_len(text, tokenizer, cache=None):
     if cache is None:
         cache = {}
     try:
@@ -27,8 +40,12 @@ def get_len(text, tokenizer=tokenizer, cache=None):
     return toklen
 
 
-def plot_length(dataset, code, name, split, maxlen):
+def get_lens(ds_code, tok, split, include_completions=False):
+    ds = get_dataset(ds_code, split)
+    print(f"{ds_code}: {split=}, n_examples={len(ds)}")
+
     # Get token lengths
+    name, maxlen = DATASETS[ds_code]
     results = []
     if split == "train":
         cfile = f"cache/{name}_lens.pkl"
@@ -44,15 +61,18 @@ def plot_length(dataset, code, name, split, maxlen):
         cache = {}
         loaded = False
 
-    for completions in tqdm(dataset.values(), desc=f"Tokenizing {code}"):
+    for completions in tqdm(ds.values(), desc=f"Tokenizing {ds_code}"):
         for pair in completions["pairs"]:
             chosen = completions["responses"][pair[0]]
             rejected = completions["responses"][pair[1]]
             info = {
-                f"Preferred length": min(get_len(chosen, cache=cache), maxlen),
-                f"Dispreferred length": min(get_len(rejected, cache=cache), maxlen),
+                f"Preferred length": min(get_len(chosen, tok, cache=cache), maxlen),
+                f"Dispreferred length": min(get_len(rejected, tok, cache=cache), maxlen),
             }
             info["Length difference"] = info["Preferred length"] - info["Dispreferred length"]
+            if include_completions:
+                info["Preferred completion"] = chosen
+                info["Dispreferred completion"] = rejected
             results.append(info)
 
     os.makedirs(os.path.dirname(cfile), exist_ok=True)
@@ -60,6 +80,12 @@ def plot_length(dataset, code, name, split, maxlen):
         with open(cfile, "wb+") as f:
             print(f"caching {cfile} for later...")
             pickle.dump(cache, f)
+
+    return ds, results
+
+
+def plot_length(dataset, code, results):
+    name, _ = DATASETS[code]
 
     # Printing for the latex table in the paper
     results = pd.DataFrame(results)
@@ -159,23 +185,6 @@ def plot_accs(accs):
 if __name__ == "__main__":
     preference_datasets.LOCAL_PATH = "../data/"
     split = "train"
-    info = {
-        # datasets from dpo paper
-        "hh": ("Anthropic RLHF HH", 500),
-        "shp": ("Stanford Human Preferences", 1000),
-        #"se": ("Stack Exchange Full", 10000),
-        "tldr": ("Webis TLDR 17", 150),
-
-        # datasets from length paper
-        "rlcd": ("RLCD Synthetic", 400),
-        "webgpt": ("WebGPT", 400),
-        #"stack": ("Stack Exchange Paired", 200),
-
-        # other datasets
-        "ultrafeedback": ("Ultrafeedback Preferences", 10000),
-        "alpaca": ("AlpacaFarm", 500),
-    }
-
     if not os.path.exists("figs"):
         os.makedirs("figs")
 
@@ -183,11 +192,12 @@ if __name__ == "__main__":
     table_texts = []
     accs = {}
 
-    for ds_code in info:
-        ds = get_dataset(ds_code, split)
-        print(f"{ds_code}: {split=}, n_examples={len(ds)}")
-        name, maxlen = info[ds_code]
-        table, acc = plot_length(ds, ds_code, name, split, maxlen)
+    tokenizer = transformers.AutoTokenizer.from_pretrained(
+        "EleutherAI/pythia-2.8b"
+    )
+    for ds_code in DATASETS:
+        dataset, results = get_lens(ds_code, tokenizer, split)
+        table, acc = plot_length(dataset, ds_code, results)
         table_texts.append(table)
         accs[ds_code] = acc
 
