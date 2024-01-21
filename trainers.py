@@ -304,24 +304,21 @@ class BasicTrainer(object):
                     chosen_len=local_eval_batch["chosen_len"],
                     rejected_len=local_eval_batch["rejected_len"]
                 )
-                results.append({
-                    "type": "chosen",
-                    "prompt": local_eval_batch["prompt"],
-                    "response": local_eval_batch["chosen_response_only"], 
-                    "policy_logps": policy_chosen_logps.cpu().numpy().tolist(),
-                    "reference_logps": reference_chosen_logps.cpu().numpy().tolist(),
-                    "rewards": chosen_rewards.cpu().numpy().tolist(),
-                    "lengths": local_eval_batch["chosen_len"].cpu().numpy().tolist()
-                })
-                results.append({
-                    "type": "rejected",
-                    "prompt": local_eval_batch["prompt"],
-                    "response": local_eval_batch["rejected_response_only"], 
-                    "policy_logps": policy_rejected_logps.cpu().numpy().tolist(),
-                    "reference_logps": reference_rejected_logps.cpu().numpy().tolist(),
-                    "rewards": rejected_rewards.cpu().numpy().tolist(),
-                    "lengths": local_eval_batch["rejected_len"].cpu().numpy().tolist()
-                })
+                for i in range(self.config.eval_batch_size):
+                    results.append({
+                        "type": "chosen",
+                        "policy_logps": policy_chosen_logps.cpu().numpy().tolist()[i],
+                        "reference_logps": reference_chosen_logps.cpu().numpy().tolist()[i],
+                        "rewards": chosen_rewards.cpu().numpy().tolist()[i],
+                        "lengths": local_eval_batch["chosen_len"].cpu().numpy().tolist()[i]
+                    })
+                    results.append({
+                        "type": "rejected",
+                        "policy_logps": policy_rejected_logps.cpu().numpy().tolist()[i],
+                        "reference_logps": reference_rejected_logps.cpu().numpy().tolist()[i],
+                        "rewards": rejected_rewards.cpu().numpy().tolist()[i],
+                        "lengths": local_eval_batch["rejected_len"].cpu().numpy().tolist()[i]
+                    })
             
         return pd.DataFrame(results)
 

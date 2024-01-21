@@ -457,8 +457,8 @@ def tokenize_batch_element(prompt: str, chosen: str, rejected: str, truncation_m
     batch['rejected'] = prompt + rejected
     batch['chosen_response_only'] = chosen
     batch['rejected_response_only'] = rejected
-    batch['chosen_len'] = len(chosen_tokens['input_ids'])
-    batch['rejected_len'] = len(rejected_tokens['input_ids'])
+    batch['chosen_len'] = len(chosen_tokens['input_ids']) - len(prompt_tokens["input_ids"])
+    batch['rejected_len'] = len(rejected_tokens['input_ids']) - len(prompt_tokens["input_ids"])
 
     for k, toks in {'chosen': chosen_sequence_tokens, 'rejected': rejected_sequence_tokens, 'prompt': prompt_tokens}.items():
         for type_key, tokens in toks.items():

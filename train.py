@@ -38,7 +38,7 @@ def worker_rewards(rank: int, world_size: int, config: DictConfig, policy: nn.Mo
 
     to_save = trainer.get_rewards()
     to_save.to_csv(config.rewards_save_path, index=False)
-    print(f'Saved rewards on {len(to_save)} eval prompts to {config.sample_path}')
+    print(f'Saved rewards on {len(to_save)} eval prompt batches to {config.rewards_save_path}')
 
 
 def worker_main(rank: int, world_size: int, config: DictConfig, policy: nn.Module, reference_model: Optional[nn.Module] = None):
@@ -130,7 +130,13 @@ def main(config: DictConfig):
         worker_sample(0, 1, config, policy)
         return
     
-    if config.get_rewards_only:
+    if config.reward_only:
+        if config.policy_archive is not None:
+            state_dict = torch.load(config.policy_archive, map_location='cpu')
+            step, metrics = state_dict['step_idx'], state_dict['metrics']
+            print(f'loading pre-trained policy weights at step {step} from {config.policy_archive} with metrics {json.dumps(metrics, indent=2)}')
+            policy.load_state_dict(state_dict['state'])
+            print('loaded pre-trained weights')
         print(f'not training, just getting rewards (saving to {config.sample_path})')
         worker_rewards(0, 1, config, policy, reference_model)
         return
