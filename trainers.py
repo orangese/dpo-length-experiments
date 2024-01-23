@@ -280,17 +280,10 @@ class BasicTrainer(object):
         np.random.seed(self.seed)
         random.seed(self.seed)
 
-        if self.config.n_eval_model_samples < self.config.eval_batch_size:
-            rank0_print(f'Warning: n_eval_model_samples ({self.config.n_eval_model_samples}) < eval_batch_size ({self.config.eval_batch_size}). Sampling from the first complete eval batch of prompts.')
-            sample_batches = self.eval_batches[:1]
-        else:
-            n_sample_batches = self.config.n_eval_model_samples // self.config.eval_batch_size
-            sample_batches = self.eval_batches[:n_sample_batches]
-
         results = []
         self.policy.eval()
 
-        for eval_batch in (tqdm.tqdm(sample_batches, desc='Computing rewards...')):
+        for eval_batch in tqdm.tqdm(self.eval_batches, desc='Computing rewards...'):
             local_eval_batch = slice_and_move_batch_for_device(eval_batch, self.rank, self.world_size, self.rank)
             with torch.no_grad():
                 policy_chosen_logps, policy_rejected_logps = self.concatenated_forward(self.policy, local_eval_batch)
@@ -310,44 +303,39 @@ class BasicTrainer(object):
                         "policy_logps": policy_chosen_logps.cpu().numpy().tolist()[i],
                         "reference_logps": reference_chosen_logps.cpu().numpy().tolist()[i],
                         "rewards": chosen_rewards.cpu().numpy().tolist()[i],
-                        "lengths": local_eval_batch["chosen_len"].cpu().numpy().tolist()[i]
+                        "lengths": local_eval_batch["chosen_len_real"][i],
+                        "completion": local_eval_batch["chosen_response_only"][i],
+                        "prompt": local_eval_batch["prompt"][i]
                     })
                     results.append({
                         "type": "rejected",
                         "policy_logps": policy_rejected_logps.cpu().numpy().tolist()[i],
                         "reference_logps": reference_rejected_logps.cpu().numpy().tolist()[i],
                         "rewards": rejected_rewards.cpu().numpy().tolist()[i],
-                        "lengths": local_eval_batch["rejected_len"].cpu().numpy().tolist()[i]
+                        "lengths": local_eval_batch["rejected_len_real"][i],
+                        "completion": local_eval_batch["rejected_response_only"][i],
+                        "prompt": local_eval_batch["prompt"][i]
                     })
             
         return pd.DataFrame(results)
 
-    def sample(self, n_per=10):
-        """Samples from self.policy over the evaluation set. Bootstraps n_per samples per prompt."""
+    def sample(self, n_per=1):
+        """Samples from self.policy over the evaluation set."""
+        if n_per != 1:
+            print("warning: ignoring n_per sample argument")
+
         torch.manual_seed(self.seed)
         np.random.seed(self.seed)
         random.seed(self.seed)
 
-        if self.config.n_eval_model_samples < self.config.eval_batch_size:
-            rank0_print(f'Warning: n_eval_model_samples ({self.config.n_eval_model_samples}) < eval_batch_size ({self.config.eval_batch_size}). Sampling from the first complete eval batch of prompts.')
-            sample_batches = self.eval_batches[:1]
-        else:
-            n_sample_batches = self.config.n_eval_model_samples // self.config.eval_batch_size
-            sample_batches = self.eval_batches[:n_sample_batches]
-
         result = {}
         self.policy.eval()
 
-        for eval_batch in (tqdm.tqdm(sample_batches, desc='Generating samples...') if self.rank == 0 else sample_batches):
+        for eval_batch in tqdm.tqdm(self.eval_batches, desc='Generating samples...'):
             local_eval_batch = slice_and_move_batch_for_device(eval_batch, self.rank, self.world_size, self.rank)
-            for i in range(n_per):
-                samples, _ = self.get_batch_samples(local_eval_batch, use_reference=False)
-
-                for prompt, sample in zip(eval_batch['prompt'], samples):
-                    try:
-                        result[prompt].append(sample)
-                    except KeyError:
-                        result[prompt] = [sample]
+            samples, _ = self.get_batch_samples(local_eval_batch, use_reference=False)
+            for prompt, sample in zip(local_eval_batch['prompt'], samples):
+                result[prompt] = sample
 
         return result
 
