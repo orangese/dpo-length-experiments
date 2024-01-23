@@ -438,6 +438,9 @@ def tokenize_batch_element(prompt: str, chosen: str, rejected: str, truncation_m
             raise ValueError(f'Unknown truncation mode: {truncation_mode}')
 
     # if that's still too long, truncate the response
+    batch = {"chosen_len_real": len(chosen_tokens['input_ids']),
+             "rejected_len_real": len(rejected_tokens['input_ids'])}
+
     if len(prompt_tokens['input_ids']) + longer_response_length > max_length:
         chosen_tokens = {k: v[:max_length - max_prompt_length] for k, v in chosen_tokens.items()}
         rejected_tokens = {k: v[:max_length - max_prompt_length] for k, v in rejected_tokens.items()}
@@ -450,15 +453,13 @@ def tokenize_batch_element(prompt: str, chosen: str, rejected: str, truncation_m
     rejected_sequence_tokens['labels'] = rejected_sequence_tokens['input_ids'][:]
     rejected_sequence_tokens['labels'][:len(prompt_tokens['input_ids'])] = [-100] * len(prompt_tokens['input_ids'])
 
-    batch = {}
-
     batch['prompt'] = prompt
     batch['chosen'] = prompt + chosen
     batch['rejected'] = prompt + rejected
     batch['chosen_response_only'] = chosen
     batch['rejected_response_only'] = rejected
-    batch['chosen_len'] = len(chosen_tokens['input_ids']) - len(prompt_tokens["input_ids"])
-    batch['rejected_len'] = len(rejected_tokens['input_ids']) - len(prompt_tokens["input_ids"])
+    batch['chosen_len'] = len(chosen_tokens['input_ids'])
+    batch['rejected_len'] = len(rejected_tokens['input_ids'])
 
     for k, toks in {'chosen': chosen_sequence_tokens, 'rejected': rejected_sequence_tokens, 'prompt': prompt_tokens}.items():
         for type_key, tokens in toks.items():
