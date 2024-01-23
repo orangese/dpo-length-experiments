@@ -6,3 +6,7 @@ cache
 outputs
 slurm
 .gptcache
+.DS_Store
+.nfs*
+sampled
+*.gpt
