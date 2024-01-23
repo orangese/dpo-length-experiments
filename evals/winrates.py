@@ -104,14 +104,13 @@ def batch_judge(batch, system, template, key, model_wins, cache_file, gpt_model,
         for a, b, prompt, model in batch
     ]
 
-
     api_key = os.getenv("OPENAI_API_KEY")
     if use_lab_key:
         api_key = os.getenv("LAB_OPENAI_API_KEY", api_key)
 
     responses = submit_jobs(requests, cache_file=cache_file, api_key=api_key)
-    for (*_, model), judgement in responses.items():
-        model_wins[model][key].append(judgement)
+    for (*_, a, b, model), judgement in responses.items():
+        model_wins[model][key].append((a, b, judgement))
 
 
 def winrates(
@@ -168,9 +167,9 @@ def winrates(
     return model_wins
 
 
-def analyze(model_wins):
+def get_flattened(model_wins):
     """
-    Analyzes winrates.
+    Returns flattened dataframe of results with length keys added.
     """
     prefix = ""
     stop = False
@@ -185,6 +184,7 @@ def analyze(model_wins):
     for model in model_wins:
         print("model:", model)
         for key, scores in model_wins[model].items():
+            scores = [tup[-1] for tup in scores]
             print("-" * 20)
             print("metric:", key)
             print("len:   ", len(scores))
@@ -195,13 +195,28 @@ def analyze(model_wins):
     flat = []
     for model in model_wins:
         for key, scores in model_wins[model].items():
-            for score in scores:
+            for (sampled, truth, score) in scores:
                 model = model.replace(prefix, "").strip("_full")
-                flat.append(dict(model=model, metric=key, win=int(score)))
+                flat.append({
+                    "model": model,
+                    "metric": key,
+                    "sampled": sampled,
+                    "truth": truth,
+                    "win": int(score),
+                })
     flat = pd.DataFrame(flat)
     arch, ds, *_ = prefix.split("_")
 
-    # Bar plot for win rates
+    flat['sampled_len'] = flat['sampled'].apply(lambda x: len(x.split()))
+    flat['truth_len'] = flat['truth'].apply(lambda x: len(x.split()))
+
+    return flat, ds
+
+
+def winrates_bar(flat, ds):
+    """
+    Bar plot with confidence bars for win rates.
+    """
     sns.barplot(flat, x="model", y="win", errorbar="ci", hue="metric")
     plt.title(f"{ds.upper()}: GPT4 winrates for quality (helpfulness) and brevity")
     plt.xlabel("Model ID")
@@ -209,7 +224,13 @@ def analyze(model_wins):
     plt.tight_layout()
     plt.savefig(f"{ds.lower()}_bar.png", dpi=200, bbox_inches='tight')
 
-   # Compute mean, std, and count for each model and metric
+
+def winrates_scatter(flat, ds):
+    """
+    Scatter plot with confidence bars for win rates.
+    """
+    # Compute mean, std, and count for each model and metric
+    flat = flat.drop(['sampled', 'truth', 'sampled_len', 'truth_len'], axis=1)
     model_stats = flat.groupby(['model', 'metric']).agg(['mean', 'std', 'count']).reset_index()
     model_stats.columns = ['model', 'metric', 'mean', 'std', 'count']
     model_stats['ci_90'] = model_stats.apply(
@@ -241,6 +262,88 @@ def analyze(model_wins):
     plt.legend()
     plt.grid(True)
     plt.savefig(f"{ds.lower()}_scatter.png", dpi=200, bbox_inches='tight')
+
+
+def winrates_length(flat, ds):
+    """
+    Plots average length vs win rates.
+    """
+    # Get average length for each model and apply 90% CI
+    lengths = flat[['model', 'sampled_len']]
+    lengths = lengths.groupby(['model']).agg(['mean', 'std', 'count']).reset_index()
+    lengths.columns = ['model', 'mean', 'std', 'count']
+    lengths['ci_90'] = lengths.apply(
+        lambda row: 1.645 * (row['std'] / np.sqrt(row['count'])),
+        axis=1
+    )
+
+    # Get win rates for each model and apply 90% CI
+    flat['win'] = flat['win'].astype(int)
+    winrates = flat[['model', 'win']]
+    winrates = winrates.groupby(['model']).agg(['mean', 'std', 'count']).reset_index()
+    winrates.columns = ['model', 'mean', 'std', 'count']
+    winrates['ci_90'] = winrates.apply(
+        lambda row: 1.645 * (row['std'] / np.sqrt(row['count'])),
+        axis=1
+    )
+
+    # Merge with winrates
+    merged = pd.merge(lengths, winrates, on='model', suffixes=('_length', '_win'))
+
+    # Plot winrates vs length
+    plt.figure(figsize=(10, 6))
+    for _, row in merged.iterrows():
+        plt.errorbar(
+            x=row['mean_length'],
+            y=row['mean_win'],
+            xerr=row['ci_90_length'],
+            yerr=row['ci_90_win'],
+            fmt='o',
+            capsize=5,
+            label=row['model']
+        )
+    
+    plt.xlabel('Mean Response Length')
+    plt.ylabel('GPT Win Rate')
+    plt.title(f'{ds.upper()}: GPT4 winrates vs. average sample length (90% CI)')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(f"{ds.lower()}_length.png", dpi=200, bbox_inches='tight')
+
+
+def winrates_length_ratio(flat, ds):
+    """
+    Plot sampled length / truth response length vs win rate.
+    """
+    flat['len_cmp'] = flat['sampled_len'] / flat['truth_len']
+    print(flat['len_cmp'].describe())
+
+    plt.figure(figsize=(10, 6))
+    sns.kdeplot(
+        data=flat,
+        x="len_cmp",
+        hue="win",
+        linewidth=2,
+        common_norm=False,
+        common_grid=True,
+        palette="Set2",
+        fill=True,
+        alpha=.5,
+    )
+    plt.xlabel("Ratio of sampled response length to ground-truth response length")
+    plt.ylabel(f"Density (n={len(flat)})")
+    plt.axvline(
+        flat["len_cmp"].mean(),
+        color="black",
+        linestyle='--',
+    )
+    plt.legend(
+        [f'Mean length ratio'],
+        prop={"size": 15},
+        loc='upper left'
+    )
+    plt.title(f"{ds.upper()}: GPT4 winrates for length ratio")
+    plt.savefig(f"{ds.lower()}_length_ratio.png", dpi=200, bbox_inches='tight')
 
 
 if __name__ == "__main__":
@@ -314,7 +417,7 @@ if __name__ == "__main__":
     truth = locals()[f"load_{args.dataset}"]()
     truth = shuffle(truth)
 
-    analyze(
+    flat, ds = get_flattened(
         winrates(
             truth,
             sampled,
@@ -329,3 +432,5 @@ if __name__ == "__main__":
             args.lab_key
         )
     )
+    for plotter in [winrates_bar, winrates_scatter, winrates_length, winrates_length_ratio]:
+        plotter(flat, ds)

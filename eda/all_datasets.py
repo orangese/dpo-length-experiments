@@ -15,13 +15,13 @@ DATASETS = {
     # datasets from dpo paper
     "hh": ("Anthropic RLHF HH", 500),
     "shp": ("Stanford Human Preferences", 1000),
-    #"se": ("Stack Exchange Full", 10000),
+    # "se": ("Stack Exchange Full", 10000),
     "tldr": ("Webis TLDR 17", 150),
 
     # datasets from length paper
     "rlcd": ("RLCD Synthetic", 400),
     "webgpt": ("WebGPT", 400),
-    #"stack": ("Stack Exchange Paired", 200),
+    # "stack": ("Stack Exchange Paired", 200),
 
     # other datasets
     "ultrafeedback": ("Ultrafeedback Preferences", 10000),
@@ -86,9 +86,9 @@ def get_lens(ds_code, tok, split, include_completions=False):
 
 def plot_length(dataset, code, results):
     name, _ = DATASETS[code]
+    results = pd.DataFrame(results)
 
     # Printing for the latex table in the paper
-    results = pd.DataFrame(results)
     pavg = round(results["Preferred length"].mean(), 1)
     pmed = round(results["Preferred length"].median(), 1)
     plen = round(results["Preferred length"].std(), 1)
@@ -175,10 +175,22 @@ def plot_accs(accs):
         names.append(name)
         acc.append(sum(arr) / len(arr))
 
-    df = pd.DataFrame({"Dataset": names, "Accuracy": acc})
-    sns.barplot(x="Dataset", y="Accuracy", data=df)
+    df = pd.DataFrame({"Dataset": names, "Percent correct": acc})
+ 
+    plt.figure(figsize=(12, 6))
+    sns.set(style="whitegrid")
+    sns.set_context("talk")
+
+    sns.barplot(x="Dataset", y="Percent correct", data=df)
+    plt.axhline(y=0.5, color='r', linestyle='--')
+    
     plt.xticks(rotation=45)
-    plt.savefig("figs/accs", dpi=500, bbox_inches="tight")
+    plt.title("Preference accuracy based on length alone")
+    plt.xlabel("Dataset")
+    plt.ylabel("Percent correct")
+
+    plt.tight_layout()
+    plt.savefig("figs/accs.png", dpi=500, bbox_inches="tight")
     plt.clf()
 
 
@@ -209,4 +221,3 @@ if __name__ == "__main__":
     print({k: round(sum(v) / len(v), 3) for k, v in accs.items()})
 
     plot_accs(accs)
-
