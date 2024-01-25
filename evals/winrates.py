@@ -222,7 +222,7 @@ def winrates_bar(flat, ds):
     plt.xlabel("Model ID")
     plt.ylabel("GPT Win Rate")
     plt.tight_layout()
-    plt.savefig(f"{ds.lower()}_bar.png", dpi=200, bbox_inches='tight')
+    plt.savefig(f"winrates/{ds.lower()}_bar.png", dpi=200, bbox_inches='tight')
 
 
 def winrates_scatter(flat, ds):
@@ -261,7 +261,7 @@ def winrates_scatter(flat, ds):
     plt.title(f'{ds.upper()}: GPT4 winrates for quality (helpfulness) vs brevity (90% CI)')
     plt.legend()
     plt.grid(True)
-    plt.savefig(f"{ds.lower()}_scatter.png", dpi=200, bbox_inches='tight')
+    plt.savefig(f"winrates/{ds.lower()}_scatter.png", dpi=200, bbox_inches='tight')
 
 
 def winrates_length(flat, ds):
@@ -308,7 +308,7 @@ def winrates_length(flat, ds):
     plt.title(f'{ds.upper()}: GPT4 winrates vs. average sample length (90% CI)')
     plt.legend()
     plt.grid(True)
-    plt.savefig(f"{ds.lower()}_length.png", dpi=200, bbox_inches='tight')
+    plt.savefig(f"winrates/{ds.lower()}_length.png", dpi=200, bbox_inches='tight')
 
 
 def winrates_length_ratio(flat, ds):
@@ -343,7 +343,7 @@ def winrates_length_ratio(flat, ds):
         loc='upper left'
     )
     plt.title(f"{ds.upper()}: GPT4 winrates for length ratio")
-    plt.savefig(f"{ds.lower()}_length_ratio.png", dpi=200, bbox_inches='tight')
+    plt.savefig(f"winrates/{ds.lower()}_length_ratio.png", dpi=200, bbox_inches='tight')
 
 
 if __name__ == "__main__":
@@ -370,7 +370,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--prompt_dir",
-        default="./",
+        default="./prompts",
         help="prompt directory"
     )
     parser.add_argument(

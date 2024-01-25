@@ -137,7 +137,7 @@ def plot_length(dataset, code, results):
         color=r, linestyle='--',
         label=f'Mean dispreferred'
     )
-    plt.savefig(f"figs/{code}", dpi=500, bbox_inches="tight")
+    plt.savefig(f"eda/{code}", dpi=500, bbox_inches="tight")
     plt.clf()
 
     # Length difference comparison plot
@@ -161,7 +161,7 @@ def plot_length(dataset, code, results):
     plt.title(name)
     plt.gca().axes.get_yaxis().set_ticks([])
 
-    plt.savefig(f"figs/{code}_diff", dpi=500, bbox_inches="tight")
+    plt.savefig(f"eda/{code}_diff", dpi=500, bbox_inches="tight")
     plt.clf()
 
     acc = (results["Length difference"] > 0).values
@@ -190,7 +190,7 @@ def plot_accs(accs):
     plt.ylabel("Percent correct")
 
     plt.tight_layout()
-    plt.savefig("figs/accs.png", dpi=500, bbox_inches="tight")
+    plt.savefig("eda/length_accs.png", dpi=500, bbox_inches="tight")
     plt.clf()
 
 
