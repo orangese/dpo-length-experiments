@@ -15,10 +15,10 @@
 source env/bin/activate
 
 ##### BASE DPO
-python -u train.py model.archive=/iris/u/rafailov/DPOExperiments/models/rafailov/pythia2.8b_sft_shp/LATEST/policy.pt policy_archive=/iris/u/rypark/cache/rypark/shp-pythia28-mod-0_2023-12-27_12-09-55_579462/step-159744/policy.pt eval_batch_size=4 reward_only=true rewards_save_path=/sailhome/rypark/dpo-length-experiments/sampled/pythia2.8b_shp_base_dpo_rewards.csv trainer=BasicTrainer datasets=[shp] n_eval_model_samples=1000 n_eval_examples=1000
+python -u train.py model.archive=/iris/u/rafailov/DPOExperiments/models/rafailov/pythia2.8b_sft_shp/LATEST/policy.pt policy_archive=/iris/u/rypark/cache/rypark/shp-pythia28-mod-0_2023-12-27_12-09-55_579462/step-159744/policy.pt eval_batch_size=4 reward_only=true rewards_save_path=/sailhome/rypark/dpo-length-experiments/sampled/pythia2.8b_shp_base_dpo_rewards.csv trainer=BasicTrainer datasets=[shp] n_eval_model_samples=256
 
 #### ALPHA 0.005 OLD
-python -u train.py model.archive=/iris/u/rafailov/DPOExperiments/models/rafailov/pythia2.8b_sft_shp/LATEST/policy.pt policy_archive=/iris/u/rypark/cache/rypark/shp-pythia28-mod-005_2023-12-28_19-22-43_109845/step-199680/policy.pt eval_batch_size=4 reward_only=true rewards_save_path=/sailhome/rypark/dpo-length-experiments/sampled/pythia2.8b_shp_alpha005_rewards.csv trainer=BasicTrainer datasets=[shp] n_eval_model_samples=1000 n_eval_examples=1000
+python -u train.py model.archive=/iris/u/rafailov/DPOExperiments/models/rafailov/pythia2.8b_sft_shp/LATEST/policy.pt policy_archive=/iris/u/rypark/cache/rypark/shp-pythia28-mod-005_2023-12-28_19-22-43_109845/step-199680/policy.pt eval_batch_size=4 reward_only=true rewards_save_path=/sailhome/rypark/dpo-length-experiments/sampled/pythia2.8b_shp_alpha005_rewards.csv trainer=BasicTrainer datasets=[shp] n_eval_model_samples=256
 
 #### ALPHA 0.01 OLD
 python -u train.py model.archive=/iris/u/rafailov/DPOExperiments/models/rafailov/pythia2.8b_sft_shp/LATEST/policy.pt policy_archive=/iris/u/rypark/cache/rypark/shp-pythia28-mod-01_2023-12-27_22-12-47_942163/step-199680/policy.pt eval_batch_size=4 reward_only=true rewards_save_path=/sailhome/rypark/dpo-length-experiments/sampled/pythia2.8b_shp_alpha01_rewards.csv trainer=BasicTrainer datasets=[shp] n_eval_model_samples=1000 n_eval_examples=1000

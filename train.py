@@ -20,6 +20,9 @@ OmegaConf.register_new_resolver("get_local_run_dir", lambda exp_name, local_dirs
 
 def worker_sample(rank: int, world_size: int, config: DictConfig, policy: nn.Module):
     """Samples from model (only BasicTrainer supported)."""
+    config.n_eval_examples = None
+    print('warning: setting config.n_eval_examples to none, use n_eval_model_samples to control how many samples')
+
     TrainerClass = getattr(trainers, config.trainer)
     print(f'Creating trainer on process {rank} with world size {world_size}')
     trainer = TrainerClass(policy, config, config.seed, config.local_run_dir, reference_model=None, rank=rank, world_size=world_size)
@@ -32,6 +35,9 @@ def worker_sample(rank: int, world_size: int, config: DictConfig, policy: nn.Mod
 
 def worker_rewards(rank: int, world_size: int, config: DictConfig, policy: nn.Module, reference_model: nn.Module):
     """Gets rewards from model (only BasicTrainer supported)."""
+    config.n_eval_examples = None
+    print('warning: setting config.n_eval_examples to none, use n_eval_model_samples to control how many rewards are sampled')
+
     TrainerClass = getattr(trainers, config.trainer)
     print(f'Creating trainer on process {rank} with world size {world_size}')
     trainer = TrainerClass(policy, config, config.seed, config.local_run_dir, reference_model=reference_model, rank=rank, world_size=world_size)

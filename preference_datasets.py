@@ -482,6 +482,7 @@ def get_batch_iterator(names: List[str],
                        n_examples: Optional[int] = None,
                        seed:int = 0,
                        silent: bool = False,
+                       deduplicate: bool = False,
                        cache_dir: Optional[str] = None) -> Iterator[Dict]:
     """Get an iterator over batches of data. Stops after n_epochs or n_examples, whichever comes first.
 
@@ -498,13 +499,15 @@ def get_batch_iterator(names: List[str],
         n_examples: Number of examples to run for. This or n_epochs must be specified.
         seed: Random seed.
         silent: Whether to silence the progress bar(s).
+        deduplicate: If true, do not include duplicate prompts.
         cache_dir: Directory to cache the datasets in.
     """
     assert n_epochs is not None or n_examples is not None, "Must specify either n_epochs or n_examples"
     if silent:
         datasets.logging.disable_progress_bar()
         datasets.logging.set_verbosity_error()
-
+   
+    print("deduplicate:", deduplicate)
     with TemporarilySeededRandom(seed):
         permutation_seeds = iter(np.random.randint(0, 2**32, size=1000000))
         flat_data = []
@@ -518,10 +521,12 @@ def get_batch_iterator(names: List[str],
     epoch_idx = 0
     example_idx = 0
     done = False
+    used = set()
+    skipped = 0
     while True:
         if n_epochs is not None and epoch_idx >= n_epochs:
             if not silent:
-                print(f'Finished generating {n_epochs} epochs on {split} split')
+                print(f'Finished generating {n_epochs} epochs on {split} split, skipped = {skipped}')
             break
         if shuffle:
             with TemporarilySeededRandom(next(permutation_seeds)):
@@ -534,13 +539,17 @@ def get_batch_iterator(names: List[str],
             if sft_mode:
                 batch_element = tokenize_batch_element(prompt, sft_target, sft_target, truncation_mode, tokenizer, max_length, max_prompt_length)
                 batch_element = {k: v for k, v in batch_element.items() if 'rejected' not in k}
+                if deduplicate and batch_element["prompt"] in used:
+                    skipped += 1
+                    continue
+                used.add(batch_element["prompt"])
                 batch.append(batch_element)
                 example_idx += 1
                 if len(batch) == batch_size:
                     yield collate_fn(batch)
                     if n_examples is not None and example_idx >= n_examples:
                         if not silent:
-                            print(f'Finished generating {n_examples} examples on {split} split')
+                            print(f'Finished generating {n_examples} examples on {split} split, skipped {skipped}')
                         done = True
 
                     batch = []
@@ -549,13 +558,17 @@ def get_batch_iterator(names: List[str],
                     if done:
                         break
                     batch_element = tokenize_batch_element(prompt, responses[p[0]], responses[p[1]], truncation_mode, tokenizer, max_length, max_prompt_length)
+                    if deduplicate and batch_element["prompt"] in used:
+                        skipped += 1
+                        continue
+                    used.add(batch_element["prompt"])
                     batch.append(batch_element)
                     example_idx += 1
                     if len(batch) == batch_size:
                         yield collate_fn(batch)
                         if n_examples is not None and example_idx >= n_examples:
                             if not silent:
-                                print(f'FINISHED {n_examples} EXAMPLES on {split} split')
+                                print(f'FINISHED {n_examples} EXAMPLES on {split} split, skipped {skipped}')
                             done = True
                         batch = []
         if done:

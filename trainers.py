@@ -170,6 +170,7 @@ class BasicTrainer(object):
             max_length=config.max_length,
             max_prompt_length=config.max_prompt_length,
             sft_mode=config.loss.name == 'sft',
+            deduplicate=config.sample_only or config.reward_only
         )
 
         self.policy = policy
@@ -182,7 +183,13 @@ class BasicTrainer(object):
             self.train_iterator = None
             rank0_print('Did not load train data iterator')
 
-        self.eval_iterator = get_batch_iterator(**data_iterator_kwargs, split='test', n_examples=config.n_eval_examples, batch_size=config.eval_batch_size, silent=rank != 0, cache_dir=get_local_dir(config.local_dirs))
+        if config.n_eval_examples is None:
+            n_epochs = 1
+            n_examples = None
+        else:
+            n_epochs = None
+            n_examples = config.n_eval_examples
+        self.eval_iterator = get_batch_iterator(**data_iterator_kwargs, split='test', n_examples=n_examples, n_epochs=n_epochs, batch_size=config.eval_batch_size, silent=rank != 0, cache_dir=get_local_dir(config.local_dirs))
         self.eval_batches = list(self.eval_iterator)
         rank0_print(f'Loaded {len(self.eval_batches)} eval batches of size {config.eval_batch_size}')
 
@@ -283,39 +290,45 @@ class BasicTrainer(object):
         results = []
         self.policy.eval()
 
-        for eval_batch in tqdm.tqdm(self.eval_batches, desc='Computing rewards...'):
-            local_eval_batch = slice_and_move_batch_for_device(eval_batch, self.rank, self.world_size, self.rank)
-            with torch.no_grad():
-                policy_chosen_logps, policy_rejected_logps = self.concatenated_forward(self.policy, local_eval_batch)
-                reference_chosen_logps, reference_rejected_logps = self.concatenated_forward(self.reference_model, local_eval_batch)
+        with tqdm.tqdm(desc="Computing rewards", total=self.config.n_eval_model_samples) as pbar:
+            for eval_batch in self.eval_batches:
+                if len(results) >= self.config.n_eval_model_samples * 2:
+                    break
+                local_eval_batch = slice_and_move_batch_for_device(eval_batch, self.rank, self.world_size, self.rank)
 
-                _, chosen_rewards, rejected_rewards = dpo_loss(
-                    policy_chosen_logps, policy_rejected_logps, reference_chosen_logps, reference_rejected_logps,
-                    beta=self.config.loss.beta,
-                    alpha=self.config.loss.alpha,
-                    reference_free=self.config.loss.reference_free,
-                    chosen_len=local_eval_batch["chosen_len"],
-                    rejected_len=local_eval_batch["rejected_len"]
-                )
-                for i in range(self.config.eval_batch_size):
-                    results.append({
-                        "type": "chosen",
-                        "policy_logps": policy_chosen_logps.cpu().numpy().tolist()[i],
-                        "reference_logps": reference_chosen_logps.cpu().numpy().tolist()[i],
-                        "rewards": chosen_rewards.cpu().numpy().tolist()[i],
-                        "lengths": local_eval_batch["chosen_len_real"][i],
-                        "completion": local_eval_batch["chosen_response_only"][i],
-                        "prompt": local_eval_batch["prompt"][i]
-                    })
-                    results.append({
-                        "type": "rejected",
-                        "policy_logps": policy_rejected_logps.cpu().numpy().tolist()[i],
-                        "reference_logps": reference_rejected_logps.cpu().numpy().tolist()[i],
-                        "rewards": rejected_rewards.cpu().numpy().tolist()[i],
-                        "lengths": local_eval_batch["rejected_len_real"][i],
-                        "completion": local_eval_batch["rejected_response_only"][i],
-                        "prompt": local_eval_batch["prompt"][i]
-                    })
+                with torch.no_grad():
+                    policy_chosen_logps, policy_rejected_logps = self.concatenated_forward(self.policy, local_eval_batch)
+                    reference_chosen_logps, reference_rejected_logps = self.concatenated_forward(self.reference_model, local_eval_batch)
+
+                    _, chosen_rewards, rejected_rewards = dpo_loss(
+                        policy_chosen_logps, policy_rejected_logps, reference_chosen_logps, reference_rejected_logps,
+                        beta=self.config.loss.beta,
+                        alpha=self.config.loss.alpha,
+                        reference_free=self.config.loss.reference_free,
+                        chosen_len=local_eval_batch["chosen_len"],
+                        rejected_len=local_eval_batch["rejected_len"]
+                    )
+                    for i in range(self.config.eval_batch_size):
+                        results.append({
+                            "type": "chosen",
+                            "policy_logps": policy_chosen_logps.cpu().numpy().tolist()[i],
+                            "reference_logps": reference_chosen_logps.cpu().numpy().tolist()[i],
+                            "rewards": chosen_rewards.cpu().numpy().tolist()[i],
+                            "lengths": local_eval_batch["chosen_len_real"][i],
+                            "completion": local_eval_batch["chosen_response_only"][i],
+                            "prompt": local_eval_batch["prompt"][i]
+                        })
+                        results.append({
+                            "type": "rejected",
+                            "policy_logps": policy_rejected_logps.cpu().numpy().tolist()[i],
+                            "reference_logps": reference_rejected_logps.cpu().numpy().tolist()[i],
+                            "rewards": rejected_rewards.cpu().numpy().tolist()[i],
+                            "lengths": local_eval_batch["rejected_len_real"][i],
+                            "completion": local_eval_batch["rejected_response_only"][i],
+                            "prompt": local_eval_batch["prompt"][i]
+                        })
+                        pbar.update(2)
+
             
         return pd.DataFrame(results)
 
@@ -331,11 +344,17 @@ class BasicTrainer(object):
         result = {}
         self.policy.eval()
 
-        for eval_batch in tqdm.tqdm(self.eval_batches, desc='Generating samples...'):
-            local_eval_batch = slice_and_move_batch_for_device(eval_batch, self.rank, self.world_size, self.rank)
-            samples, _ = self.get_batch_samples(local_eval_batch, use_reference=False)
-            for prompt, sample in zip(local_eval_batch['prompt'], samples):
-                result[prompt] = sample
+        with tqdm.tqdm(desc="Sampling", total=self.config.n_eval_model_samples) as pbar:
+            for eval_batch in self.eval_batches:
+                if len(result) >= self.config.n_eval_model_samples:
+                    break
+            
+                local_eval_batch = slice_and_move_batch_for_device(eval_batch, self.rank, self.world_size, self.rank)
+
+                samples, _ = self.get_batch_samples(local_eval_batch, use_reference=False)
+                for prompt, sample in zip(local_eval_batch['prompt'], samples):
+                    result[prompt] = sample
+                    pbar.update(1)
 
         return result
 
