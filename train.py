@@ -104,16 +104,19 @@ def main(config: DictConfig):
     print('=' * 80)
     print(f'Writing to {socket.gethostname()}:{config.local_run_dir}')
     print('=' * 80)
+
+    if config.reward_only:
+        assert config.loss.name == "dpo", "for reward sampling, use loss = dpo"
  
     os.environ['XDG_CACHE_HOME'] = get_local_dir(config.local_dirs)
     print('building policy')
-    model_kwargs = {'device_map': 'balanced'} if config.trainer == 'BasicTrainer' else {}
+    model_kwargs = {'device_map': 'balanced', "trust_remote_code": True} if config.trainer == 'BasicTrainer' else {}
     policy_dtype = getattr(torch, config.model.policy_dtype)
     policy = transformers.AutoModelForCausalLM.from_pretrained(
         config.model.name_or_path, cache_dir=get_local_dir(config.local_dirs), low_cpu_mem_usage=True, torch_dtype=policy_dtype, **model_kwargs)
     disable_dropout(policy)
 
-    if config.loss.name == 'dpo' and not config.sample_only:
+    if config.loss.name == 'dpo' and not config.sample_only and not config.save_as_hf:
         print('building reference model')
         reference_model_dtype = getattr(torch, config.model.reference_dtype)
         reference_model = transformers.AutoModelForCausalLM.from_pretrained(
@@ -127,9 +130,16 @@ def main(config: DictConfig):
         step, metrics = state_dict['step_idx'], state_dict['metrics']
         print(f'loading pre-trained weights at step {step} from {config.model.archive} with metrics {json.dumps(metrics, indent=2)}')
         policy.load_state_dict(state_dict['state'])
-        if config.loss.name == 'dpo' and not config.sample_only:
+        if config.loss.name == 'dpo' and not config.sample_only and not config.save_as_hf:
             reference_model.load_state_dict(state_dict['state'])
         print('loaded pre-trained weights')
+
+    if config.save_as_hf is not None:
+        assert config.trainer == 'BasicTrainer', "save with BasicTrainer"
+        print(f"saving hf format to {config.save_as_hf}")
+        policy.save_pretrained(config.save_as_hf)
+        print("done saving, exiting")
+        return
 
     if config.sample_only:
         print(f'not training, just sampling (saving to {config.sample_path})')

@@ -336,6 +336,26 @@ def get_hh(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str,
     return data
 
 
+def get_local_sampled(name: str, silent: bool, cache_dir: str = None):
+    print(f"loading from local dataset {name}, ignoring cache_dir")
+    with open(name, "r") as f:
+        dataset = json.load(f)
+
+    data = defaultdict(lambda: defaultdict(list))
+    for prompt in tqdm.tqdm(dataset, desc=f'Processing {name}', disable=silent):
+        # sampled dataset looks like {prompt: sampled response}, so there is no "rejected"
+        # response. We set chosen = rejected = sampled as a dummy, b/c likely the only
+        # thing we're doing with this dataset is computing rewards.
+        chosen, rejected = dataset[prompt], dataset[prompt]
+        responses = [chosen, rejected]
+        n_responses = len(data[prompt]['responses'])
+        data[prompt]['pairs'].append((n_responses, n_responses + 1))
+        data[prompt]['responses'].extend(responses)
+        data[prompt]['sft_target'] = chosen
+
+    return data
+
+
 def get_dataset(name: str, split: str, silent: bool = False, cache_dir: str = None):
     """Load the given dataset by name. Supported by default are 'shp', 'hh', and 'se'."""
     if name == 'shp':
@@ -356,6 +376,8 @@ def get_dataset(name: str, split: str, silent: bool = False, cache_dir: str = No
         data = get_tldr(split, silent=silent, cache_dir=cache_dir)
     elif name == "ultrafeedback":
         data = get_ultrafeedback(split, silent=silent, cache_dir=cache_dir)
+    elif os.path.exists(name):  # Load from local sampled dataset
+        data = get_local_sampled(name, silent=silent, cache_dir=cache_dir)
     else:
         raise ValueError(f"Unknown dataset '{name}'")
 
