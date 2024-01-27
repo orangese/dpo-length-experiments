@@ -138,6 +138,9 @@ def main(config: DictConfig):
         assert config.trainer == 'BasicTrainer', "save with BasicTrainer"
         print(f"saving hf format to {config.save_as_hf}")
         policy.save_pretrained(config.save_as_hf)
+        print("saving tokenizer too")
+        tok = transformers.AutoTokenizer.from_pretrained(config.model.tokenizer_name_or_path or config.model.name_or_path)
+        tok.save_pretrained(config.save_as_hf)
         print("done saving, exiting")
         return
 
