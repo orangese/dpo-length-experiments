@@ -47,6 +47,14 @@ def worker_rewards(rank: int, world_size: int, config: DictConfig, policy: nn.Mo
     print(f'Saved rewards on {len(to_save)} eval prompt batches to {config.rewards_save_path}')
 
 
+def worker_save(rank: int, world_size: int, config: DictConfig, policy: nn.Module, reference_model: nn.Module):
+    TrainerClass = getattr(trainers, config.trainer)
+    print(f'Creating trainer on process {rank} with world size {world_size}')
+    trainer = TrainerClass(policy, config, config.seed, config.local_run_dir, reference_model=reference_model, rank=rank, world_size=world_size)
+    trainer.save(os.path.join(config.save_dpo_format, "LATEST"), only_policy=True)
+    print('saved to ' + os.path.join(config.save_dpo_format, "LATEST"))
+
+
 def worker_main(rank: int, world_size: int, config: DictConfig, policy: nn.Module, reference_model: Optional[nn.Module] = None):
     """Main function for each worker process (may be only 1 for BasicTrainer/TensorParallelTrainer)."""
     if 'FSDP' in config.trainer:
@@ -133,6 +141,11 @@ def main(config: DictConfig):
         if config.loss.name == 'dpo' and not config.sample_only and not config.save_as_hf:
             reference_model.load_state_dict(state_dict['state'])
         print('loaded pre-trained weights')
+
+    if config.save_dpo_format is not None:
+        print(f"saving with custom dpo format to {config.save_dpo_format}")
+        worker_save(0, 1, config, policy, reference_model)
+        return
 
     if config.save_as_hf is not None:
         assert config.trainer == 'BasicTrainer', "save with BasicTrainer"
