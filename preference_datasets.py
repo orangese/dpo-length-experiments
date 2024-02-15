@@ -337,21 +337,34 @@ def get_hh(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str,
 
 
 def get_local_sampled(name: str, silent: bool, cache_dir: str = None):
+
+    def trim(prompt, response):
+        for i in range(len(prompt)):
+            j = response.find(prompt[i:])
+            if j != -1:
+                return response[j + len(prompt[i:]) + 1:]
+        return response
+
     print(f"loading from local dataset {name}, ignoring cache_dir")
     with open(name, "r") as f:
         dataset = json.load(f)
 
+    kword = "Assistant:"
     data = defaultdict(lambda: defaultdict(list))
     for prompt in tqdm.tqdm(dataset, desc=f'Processing {name}', disable=silent):
         # sampled dataset looks like {prompt: sampled response}, so there is no "rejected"
         # response. We set chosen = rejected = sampled as a dummy, b/c likely the only
         # thing we're doing with this dataset is computing rewards.
-        chosen, rejected = dataset[prompt], dataset[prompt]
-        responses = [chosen, rejected]
+        v = dataset[prompt]
+        if isinstance(v, list):
+            v = v[0]  # only take one sample if there are multiple
+        response = trim(prompt, v)
+        assert prompt not in response
+        responses = [response, response]
         n_responses = len(data[prompt]['responses'])
         data[prompt]['pairs'].append((n_responses, n_responses + 1))
         data[prompt]['responses'].extend(responses)
-        data[prompt]['sft_target'] = chosen
+        data[prompt]['sft_target'] = response
 
     return data
 
@@ -559,7 +572,11 @@ def get_batch_iterator(names: List[str],
             if done:
                 break
             if sft_mode:
-                batch_element = tokenize_batch_element(prompt, sft_target, sft_target, truncation_mode, tokenizer, max_length, max_prompt_length)
+                try:
+                    batch_element = tokenize_batch_element(prompt, sft_target, sft_target, truncation_mode, tokenizer, max_length, max_prompt_length)
+                except AssertionError:
+                    print("failed to load 1 sample")
+                    continue
                 batch_element = {k: v for k, v in batch_element.items() if 'rejected' not in k}
                 if deduplicate and batch_element["prompt"] in used:
                     skipped += 1
@@ -579,7 +596,11 @@ def get_batch_iterator(names: List[str],
                 for p in pairs:
                     if done:
                         break
-                    batch_element = tokenize_batch_element(prompt, responses[p[0]], responses[p[1]], truncation_mode, tokenizer, max_length, max_prompt_length)
+                    try:
+                        batch_element = tokenize_batch_element(prompt, responses[p[0]], responses[p[1]], truncation_mode, tokenizer, max_length, max_prompt_length)
+                    except AssertionError:
+                        print("failed to load 1 sample")
+                        continue
                     if deduplicate and batch_element["prompt"] in used:
                         skipped += 1
                         continue
