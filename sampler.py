@@ -17,13 +17,23 @@ def is_sft(path):
 
 
 def get_sample_path(sample_dir, archive, ckpt_dir, ds, do_sample):
-    with open(os.path.join(args.archive_dir, archive, "config.yaml"), "r") as f:
-        config = yaml.load(f, Loader=yaml.FullLoader)
+    try:
+        with open(os.path.join(args.archive_dir, archive, "config.yaml"), "r") as f:
+            config = yaml.load(f, Loader=yaml.FullLoader)
 
-    if config['loss']['name'] == "dpo":
-        beta, alpha = config['loss']['beta'], config['loss']['alpha']
-    else:
+        if config['loss']['name'] == "dpo":
+            beta, alpha = config['loss']['beta'], config['loss']['alpha']
+        else:
+            beta, alpha = 0.0, 0.0
+
+    except FileNotFoundError:
+        print(f"no config.yaml, assuming sft... ", end="")
         beta, alpha = 0.0, 0.0
+
+    if args.beta is not None and args.beta != beta:
+        return None
+    elif args.alpha is not None and args.alpha != alpha:
+        return None
 
     path_template = "{model}__{ds}__b{b}__a{a}__s{ckpt_dir}__{sample_type}"
    
@@ -42,17 +52,26 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dataset",
         type=str,
+        required=True,
         help="dataset name to use"
     )
     parser.add_argument(
         "--archive_dir",
         type=str,
+        required=True,
         help="path to directory containing runs/archives"
     )
     parser.add_argument(
         "--sample_dir",
         type=str,
+        required=True,
         help="path to directory to sample samples in",
+    )
+    parser.add_argument(
+        "--archive",
+        type=str,
+        nargs="*",
+        help="archive(s) in archive_dir to sample from, default to all"
     )
     parser.add_argument(
         "--rewards",
@@ -74,7 +93,12 @@ if __name__ == "__main__":
         "--n_ckpts",
         type=int,
         help="how many checkpoints to sample from per run",
-        default=5,
+        default=1,
+    )
+    parser.add_argument(
+        "--allow_fewer_ckpts",
+        action="store_true",
+        help="if true, don't skip archives with less than n_ckpts checkpoints"
     )
     parser.add_argument(
         "--sft_archive",
@@ -89,9 +113,27 @@ if __name__ == "__main__":
         default=None
     )
     parser.add_argument(
+        "--max_len",
+        type=int,
+        help="if sampling, max number of new tokens to generate on top of prompt",
+        default=512
+    )
+    parser.add_argument(
         "--strict",
         action="store_true",
         help="if true, only match run dirs '[MODEL]-[DATASET]-b[#]-a[#]'"
+    )
+    parser.add_argument(
+        "--beta",
+        type=float,
+        help="filter by a certain beta value",
+        default=None
+    )
+    parser.add_argument(
+        "--alpha",
+        type=float,
+        help="filter by a certain alpha value",
+        default=None
     )
     parser.add_argument(
         "--overwrite",
@@ -104,10 +146,21 @@ if __name__ == "__main__":
         help="if true, run rewards sampling even if sampling script doesn't exist yet"
     )
     parser.add_argument(
+        "--exclude_last_ckpt",
+        action="store_true",
+        help="if true, exclude last checkpoint from sampling (n_ckpt - 1 will be used)"
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="if true, only submit one batch job"
     )
+    parser.add_argument(
+        "--dry_run",
+        action="store_true",
+        help="if true, do dry run and don't submit any jobs"
+    )
+
     args = parser.parse_args()
 
     template = "scripts/templates/sample.sh"
@@ -121,16 +174,22 @@ if __name__ == "__main__":
     sample_dir = os.path.abspath(os.path.realpath(args.sample_dir))
     pattern = f"^{args.model}-{args.dataset}+-b\d+-a\d+$"
     collected = []
-    fractions = [x / (args.n_ckpts - 1) for x in range(args.n_ckpts - 1)]
-    fractions.append(1)
+    fractions = [x / (args.n_ckpts - 1) for x in range(max(args.n_ckpts, 1) - 1)]
+    if not args.exclude_last_ckpt:
+        fractions.append(1)
+    print("fractions for sampling:", fractions)
 
-    for i, fdir in enumerate(os.listdir(args.archive_dir)):
+    files = args.archive or os.listdir(args.archive_dir)
+    for i, fdir in enumerate(files):
         print(f"({i + 1}) checking {fdir}... ", end="")
         if args.strict and re.match(pattern, fdir) is None:
             print("failed strict re match")
             continue
         elif args.dataset not in fdir:
             print("dataset name not in path")
+            continue
+        elif fdir not in os.listdir(args.archive_dir):
+            print("not found in archive dir")
             continue
 
         archive_dirs = glob.glob(os.path.join(args.archive_dir, fdir, "step-*"))
@@ -142,20 +201,24 @@ if __name__ == "__main__":
         if args.max_step is not None and not is_sft(fdir):
             archive_dirs = [d for d in archive_dirs if int(d.replace("step-", "").replace("LATEST", '0')) <= args.max_step]
         
-        if not is_sft(fdir) and len(archive_dirs) < args.n_ckpts:
+        if not is_sft(fdir) and len(archive_dirs) < args.n_ckpts and not args.allow_fewer_ckpts:
             print(f"too few ckpts ({len(archive_dirs)} < {args.n_ckpts})")
             continue
 
-        print(f"found {len(archive_dirs)}")
         if len(archive_dirs) > args.n_ckpts:
             ind = [min(int(round(f * len(archive_dirs))), len(archive_dirs) - 1) for f in fractions]
             archive_dirs = [list(archive_dirs)[i] for i in ind]
 
         ckpt_samples_info = []
         do_sample = not args.rewards
-        
+       
+        continue_ = False
         for ckpt_dir in archive_dirs:
             ckpt_sample_path = get_sample_path(sample_dir, fdir, ckpt_dir, args.dataset, do_sample=do_sample)
+            if ckpt_sample_path is None:
+                continue_ = True
+                break
+
             dataset = args.dataset
 
             if (os.path.exists(ckpt_sample_path) or args.run_anyways) and args.rewards_on_samples:
@@ -165,12 +228,19 @@ if __name__ == "__main__":
                 ckpt_sample_path = get_sample_path(sample_dir, fdir, ckpt_dir, ds_id, do_sample=False)
 
             elif args.rewards_on_samples:
+                print(ckpt_sample_path)
                 print("rewards_on_samples but no sample path found")
                 continue
-           
+ 
             ckpt_samples_info.append((ckpt_dir, ckpt_sample_path, dataset))
 
-        collected.append((ckpt_samples_info, fdir))
+        if continue_:
+            print(f"alpha/beta value mismatch")
+            continue
+
+        print(f"found {len(ckpt_samples_info)} after filtering")
+        if len(ckpt_samples_info) != 0:
+            collected.append((ckpt_samples_info, fdir))
 
     collected = list(sorted(collected, key=lambda d: len(d[0])))
     print()
@@ -193,6 +263,8 @@ if __name__ == "__main__":
                     )
                 )
                 sft_archive = os.path.join(args.archive_dir, sft_archives[0][1], sft_archives[0][0][-1][0])
+                if not sft_archive.endswith("policy.pt"):
+                    sft_archive = os.path.join(sft_archive, "policy.pt")
             except IndexError:
                 raise ValueError("no sft archive found, can't compute rewards")
         print(f"using {sft_archive} as sft archive")
@@ -205,7 +277,7 @@ if __name__ == "__main__":
             if os.path.exists(sample_path) and not args.overwrite:
                 print(f"skipping existing sample {sample_path}")
                 continue
-            elif fdir in sft_archive:
+            elif sft_archive is not None and (fdir in sft_archive or "b0-a0" in fdir):
                 print(f"skipping sft archive {fdir} for reward computation")
                 continue
            
@@ -215,7 +287,9 @@ if __name__ == "__main__":
                 sample_path=sample_path,
                 dataset=dataset,
                 dataset_id=args.dataset + ("_samples" if args.rewards_on_samples else ""),
-                sft_archive=sft_archive
+                sft_archive=sft_archive,
+                max_len=args.max_len,
+                model=args.model
             )
 
             if first:
@@ -236,5 +310,9 @@ if __name__ == "__main__":
             with open(tmpfile, "w+") as write:
                 for char in cmd:
                     write.write(char)
-            os.system(f"sbatch {tmpfile}")
+
+            if args.dry_run:
+                print(f"would write to {sample_path}... dry run complete")
+            else:
+                os.system(f"sbatch {tmpfile}")
             os.remove(tmpfile)

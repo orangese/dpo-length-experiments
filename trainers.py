@@ -308,6 +308,8 @@ class BasicTrainer(object):
                         chosen_len=local_eval_batch["chosen_len"],
                         rejected_len=local_eval_batch["rejected_len"]
                     )
+                    chosen_rewards /= self.config.loss.beta
+                    rejected_rewards /= self.config.loss.beta
                     for i in range(self.config.eval_batch_size):
                         results.append({
                             "type": "chosen",
@@ -329,7 +331,6 @@ class BasicTrainer(object):
                         })
                         pbar.update(2)
 
-            
         return pd.DataFrame(results)
 
     def sample(self, n_per=1):
@@ -507,19 +508,28 @@ class BasicTrainer(object):
             'metrics': metrics if metrics is not None else {},
         }, output_path)
     
-    def save(self, output_dir: Optional[str] = None, metrics: Optional[Dict] = None):
+    def save(self, output_dir: Optional[str] = None, metrics: Optional[Dict] = None, only_policy: bool = False):
         """Save policy, optimizer, and scheduler state to disk."""
+    
+        try:
+            n_examples = self.example_counter
+        except:
+            n_examples = 0
 
         policy_state_dict = self.policy.state_dict()
-        self.write_state_dict(self.example_counter, policy_state_dict, metrics, 'policy.pt', output_dir)
+        self.write_state_dict(n_examples, policy_state_dict, metrics, 'policy.pt', output_dir)
         del policy_state_dict
 
-        optimizer_state_dict = self.optimizer.state_dict()
-        self.write_state_dict(self.example_counter, optimizer_state_dict, metrics, 'optimizer.pt', output_dir)
-        del optimizer_state_dict
+        if not only_policy:
+            try:
+                optimizer_state_dict = self.optimizer.state_dict()
+                self.write_state_dict(n_examples, optimizer_state_dict, metrics, 'optimizer.pt', output_dir)
+                del optimizer_state_dict
 
-        scheduler_state_dict = self.scheduler.state_dict()
-        self.write_state_dict(self.example_counter, scheduler_state_dict, metrics, 'scheduler.pt', output_dir)
+                scheduler_state_dict = self.scheduler.state_dict()
+                self.write_state_dict(n_examples, scheduler_state_dict, metrics, 'scheduler.pt', output_dir)
+            except:
+                pass
 
 
 class FSDPTrainer(BasicTrainer):
