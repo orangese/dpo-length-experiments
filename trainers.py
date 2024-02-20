@@ -308,8 +308,6 @@ class BasicTrainer(object):
                         chosen_len=local_eval_batch["chosen_len"],
                         rejected_len=local_eval_batch["rejected_len"]
                     )
-                    chosen_rewards /= self.config.loss.beta
-                    rejected_rewards /= self.config.loss.beta
                     for i in range(self.config.eval_batch_size):
                         results.append({
                             "type": "chosen",

@@ -225,7 +225,6 @@ def get_stack(split: str, silent: bool = False, cache_dir: str = None) -> Dict[s
 
     return data
 
-
 def get_tldr(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str, Dict[str, Union[List[Tuple[int, int]], List[str], str]]]:
     datapath = os.path.join(LOCAL_PATH, "tldr/comparisons")
 
@@ -241,10 +240,11 @@ def get_tldr(split: str, silent: bool = False, cache_dir: str = None) -> Dict[st
         with open(f, "r") as fobj:
             for jline in fobj.readlines():
                 sample = json.loads(jline)
-                prompt = sample["info"]["post"]
                 y1 = sample["summaries"][0]["text"]
                 y2 = sample["summaries"][1]["text"]
 
+                d = sample["info"]
+                prompt = f"SUBREDDIT: r/{d['subreddit']}\nTITLE: {d['title']}\nPOST: {d['post']}\nTL;DR: "
                 if sample["split"] == split:
                     tldr.append({
                         "prompt": prompt,

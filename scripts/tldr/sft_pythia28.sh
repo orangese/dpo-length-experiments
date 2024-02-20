@@ -3,7 +3,7 @@
 #SBATCH --partition=iris-hi
 #SBATCH --nodes=1
 #SBATCH --mem=200G
-#SBATCH --gres=gpu:titanrtx:4
+#SBATCH --gres=gpu:a40:4
 #SBATCH --time=240:00:00
 #SBATCH --job-name=tldr-pythia28-sft
 #SBATCH --output slurm/%j.out

@@ -31,7 +31,8 @@ def get_sample_path(sample_dir, archive, ckpt_dir, ds, do_sample):
         beta, alpha = 0.0, 0.0
 
     if args.beta is not None and args.beta != beta:
-        return None
+        if beta != 0 or (not args.rewards and not args.rewards_on_samples):
+            return None
     elif args.alpha is not None and args.alpha != alpha:
         return None
 
