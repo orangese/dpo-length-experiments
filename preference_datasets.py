@@ -349,7 +349,6 @@ def get_local_sampled(name: str, silent: bool, cache_dir: str = None):
     with open(name, "r") as f:
         dataset = json.load(f)
 
-    kword = "Assistant:"
     data = defaultdict(lambda: defaultdict(list))
     for prompt in tqdm.tqdm(dataset, desc=f'Processing {name}', disable=silent):
         # sampled dataset looks like {prompt: sampled response}, so there is no "rejected"
