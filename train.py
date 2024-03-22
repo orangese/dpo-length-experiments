@@ -1,5 +1,6 @@
 import torch
 torch.backends.cuda.matmul.allow_tf32 = True
+from functools import partial
 import torch.nn as nn
 import transformers
 from utils import get_local_dir, get_local_run_dir, disable_dropout, init_distributed, get_open_port
@@ -17,6 +18,9 @@ import resource
 
 OmegaConf.register_new_resolver("get_local_run_dir", lambda exp_name, local_dirs: get_local_run_dir(exp_name, local_dirs))
 
+def lr(step, config):
+    return min(1.0, (step + 1) / (config.warmup_steps + 1))
+
 
 def worker_sample(rank: int, world_size: int, config: DictConfig, policy: nn.Module):
     """Samples from model (only BasicTrainer supported)."""
@@ -27,7 +31,9 @@ def worker_sample(rank: int, world_size: int, config: DictConfig, policy: nn.Mod
     print(f'Creating trainer on process {rank} with world size {world_size}')
     trainer = TrainerClass(policy, config, config.seed, config.local_run_dir, reference_model=None, rank=rank, world_size=world_size)
 
-    to_save = trainer.sample(n_per=config.samples_per_prompt)
+    to_save = trainer.sample(n_per=config.samples_per_prompt, num_beams=config.num_beams, no_repeat_ngram_size=config.no_repeat_ngram_size,
+                             repetition_penalty=config.repetition_penalty, temperature=config.temperature,
+                             top_k=config.top_k, penalty_alpha=config.penalty_alpha, top_p=config.top_p)
     with open(config.sample_path, "w+") as d:
         json.dump(to_save, d, indent=4)
     print(f'Saved samples on {len(to_save)} eval prompts to {config.sample_path}')
@@ -55,7 +61,7 @@ def worker_save(rank: int, world_size: int, config: DictConfig, policy: nn.Modul
     print('saved to ' + os.path.join(config.save_dpo_format, "LATEST"))
 
 
-def worker_main(rank: int, world_size: int, config: DictConfig, policy: nn.Module, reference_model: Optional[nn.Module] = None):
+def worker_main(rank: int, world_size: int, config: DictConfig, policy: nn.Module, reference_model: Optional[nn.Module] = None, step: int = 0):
     """Main function for each worker process (may be only 1 for BasicTrainer/TensorParallelTrainer)."""
     if 'FSDP' in config.trainer:
         init_distributed(rank, world_size, port=config.fsdp_port)
@@ -76,9 +82,10 @@ def worker_main(rank: int, world_size: int, config: DictConfig, policy: nn.Modul
 
     TrainerClass = getattr(trainers, config.trainer)
     print(f'Creating trainer on process {rank} with world size {world_size}')
+    print(f"Starting from example counter {step} with batch size {config.batch_size} (updates = {step // config.batch_size})")
     trainer = TrainerClass(policy, config, config.seed, config.local_run_dir, reference_model=reference_model, rank=rank, world_size=world_size)
 
-    trainer.train()
+    trainer.train(example_counter_start=step, batch_counter_start=step // config.batch_size)
     trainer.save()
 
 
@@ -122,7 +129,10 @@ def main(config: DictConfig):
     policy_dtype = getattr(torch, config.model.policy_dtype)
     policy = transformers.AutoModelForCausalLM.from_pretrained(
         config.model.name_or_path, cache_dir=get_local_dir(config.local_dirs), low_cpu_mem_usage=True, torch_dtype=policy_dtype, **model_kwargs)
+    print(config.model.name_or_path, "NAME OR PATH")
     disable_dropout(policy)
+
+    step = 0
 
     if config.loss.name == 'dpo' and not config.sample_only and not config.save_as_hf:
         print('building reference model')
@@ -138,9 +148,18 @@ def main(config: DictConfig):
         step, metrics = state_dict['step_idx'], state_dict['metrics']
         print(f'loading pre-trained weights at step {step} from {config.model.archive} with metrics {json.dumps(metrics, indent=2)}')
         policy.load_state_dict(state_dict['state'])
-        if config.loss.name == 'dpo' and not config.sample_only and not config.save_as_hf:
+        if config.loss.name == 'dpo' and not config.sample_only and not config.save_as_hf and config.sft_archive is None:
             reference_model.load_state_dict(state_dict['state'])
+            print('loaded reference weights (same as config.model.archive)')
         print('loaded pre-trained weights')
+
+    if config.sft_archive is not None:
+        assert config.optimizer_archive, "use sft_archive for resuming training, so specify optimizer_archive too"
+        state_dict = torch.load(config.sft_archive, map_location='cpu')
+        step, metrics = state_dict['step_idx'], state_dict['metrics']
+        print(f'[reference] loading pre-trained weights at step {step} from {config.sft_archive} with metrics {json.dumps(metrics, indent=2)}')
+        reference_model.load_state_dict(state_dict['state'])
+        print('loaded reference weights (from config.sft_archive)')
 
     if config.save_dpo_format is not None:
         print(f"saving with custom dpo format to {config.save_dpo_format}")
@@ -179,7 +198,7 @@ def main(config: DictConfig):
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
         resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
         print(f'setting RLIMIT_NOFILE soft limit to {hard} from {soft}')
-        mp.spawn(worker_main, nprocs=world_size, args=(world_size, config, policy, reference_model), join=True)
+        mp.spawn(worker_main, nprocs=world_size, args=(world_size, config, policy, reference_model, step), join=True)
     else:
         print('starting single-process worker')
         worker_main(0, 1, config, policy, reference_model)

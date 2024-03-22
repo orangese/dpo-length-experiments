@@ -8,6 +8,13 @@ exp_name: pythia-rlcd-test
 sample_only: false
 samples_per_prompt: 1
 sample_path: null
+num_beams: 1
+repetition_penalty: 1.0
+top_k: 50
+top_p: 1.0
+penalty_alpha: 0.0
+temperature: 1.0
+no_repeat_ngram_size: 0
 
 # reward stuff
 reward_only: false
@@ -15,6 +22,11 @@ rewards_save_path: null
 policy_archive: null
 save_as_hf: null
 save_dpo_format: null
+
+# other
+optimizer_archive: null
+scheduler_archive: null
+sft_archive: null
 
 # the batch size for training; for FSDP, the batch size per GPU is batch_size / (grad_accumulation_steps * num_gpus)
 batch_size: 2

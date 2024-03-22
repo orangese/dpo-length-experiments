@@ -494,6 +494,7 @@ def tokenize_batch_element(prompt: str, chosen: str, rejected: str, truncation_m
     batch['rejected_response_only'] = rejected
     batch['chosen_len'] = len(chosen_tokens['input_ids'])
     batch['rejected_len'] = len(rejected_tokens['input_ids'])
+    batch['prompt_len'] = len(prompt_tokens['input_ids'])
 
     for k, toks in {'chosen': chosen_sequence_tokens, 'rejected': rejected_sequence_tokens, 'prompt': prompt_tokens}.items():
         for type_key, tokens in toks.items():
@@ -546,7 +547,7 @@ def get_batch_iterator(names: List[str],
         permutation_seeds = iter(np.random.randint(0, 2**32, size=1000000))
         flat_data = []
         for name in names:
-            truncation_mode = 'keep_end' if name == 'hh' else 'keep_start'
+            truncation_mode = 'keep_end'# if name == 'hh' or name == 'tldr' else 'keep_start'
             for prompt, data in get_dataset(name, split, silent=silent, cache_dir=cache_dir).items():
                 flat_data.append((prompt, data['responses'], data['pairs'], data['sft_target'], truncation_mode))
 

@@ -1,3 +1,4 @@
+import json
 import torch
 torch.backends.cuda.matmul.allow_tf32 = True
 import torch.nn.functional as F
@@ -193,20 +194,26 @@ class BasicTrainer(object):
         self.eval_batches = list(self.eval_iterator)
         rank0_print(f'Loaded {len(self.eval_batches)} eval batches of size {config.eval_batch_size}')
 
-    def get_batch_samples(self, batch: Dict[str, torch.LongTensor], use_reference: bool = False) -> Tuple[str, str]:
+    def get_batch_samples(self, batch: Dict[str, torch.LongTensor], use_reference: bool = False, num_beams: int = None, repetition_penalty: float = 1.0,
+                          top_k: int = 50, penalty_alpha: float = 0.0, temperature: float = 1.0,
+                          top_p: float = 1.0, no_repeat_ngram_size: int = 0) -> Tuple[str, str]:
         """Generate samples from the policy (and reference model, if doing DPO training) for the given batch of inputs."""
 
         # FSDP generation according to https://github.com/pytorch/pytorch/issues/100069
         ctx = lambda: (FSDP.summon_full_params(self.policy, writeback=False, recurse=False) if 'FSDP' in self.config.trainer else contextlib.nullcontext())
         with ctx():
             policy_output = self.policy.generate(
-                batch['prompt_input_ids'], attention_mask=batch['prompt_attention_mask'], max_length=self.config.max_length, do_sample=True, pad_token_id=self.tokenizer.pad_token_id)
+                batch['prompt_input_ids'], attention_mask=batch['prompt_attention_mask'], max_length=self.config.max_length, do_sample=True, pad_token_id=self.tokenizer.pad_token_id,
+                num_beams=num_beams, repetition_penalty=repetition_penalty, top_k=top_k, penalty_alpha=penalty_alpha, temperature=temperature,
+                no_repeat_ngram_size=no_repeat_ngram_size, top_p=top_p)
 
         if use_reference:
             ctx = lambda: (FSDP.summon_full_params(self.reference_model, writeback=False, recurse=False) if 'FSDP' in self.config.trainer else contextlib.nullcontext())
             with ctx():
                 reference_output = self.reference_model.generate(
-                    batch['prompt_input_ids'], attention_mask=batch['prompt_attention_mask'], max_length=self.config.max_length, do_sample=True, pad_token_id=self.tokenizer.pad_token_id)
+                    batch['prompt_input_ids'], attention_mask=batch['prompt_attention_mask'], max_length=self.config.max_length, do_sample=True, pad_token_id=self.tokenizer.pad_token_id,
+                    num_beams=num_beams, repetition_penalty=repetition_penalty, top_k=top_k, penalty_alpha=penalty_alpha, temperature=temperature,
+                    no_repeat_ngram_size=no_repeat_ngram_size, top_p=top_p)
 
         policy_output = pad_to_length(policy_output, self.config.max_length, self.tokenizer.pad_token_id)
         policy_output = all_gather_if_needed(policy_output, self.rank, self.world_size)
@@ -221,18 +228,49 @@ class BasicTrainer(object):
 
         return policy_output_decoded, reference_output_decoded
     
-    def concatenated_forward(self, model: nn.Module, batch: Dict[str, Union[List, torch.LongTensor]]) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
+    def concatenated_forward(self, model: nn.Module, batch: Dict[str, Union[List, torch.LongTensor]], return_z: bool = False) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
         """Run the given model on the given batch of inputs, concatenating the chosen and rejected inputs together.
         
            We do this to avoid doing two forward passes, because it's faster for FSDP.
         """
         concatenated_batch = concatenated_inputs(batch)
         all_logits = model(concatenated_batch['concatenated_input_ids'], attention_mask=concatenated_batch['concatenated_attention_mask']).logits.to(torch.float32)
-        all_logps = _get_batch_logps(all_logits, concatenated_batch['concatenated_labels'], average_log_prob=False)
-        chosen_logps = all_logps[:batch['chosen_input_ids'].shape[0]]
-        rejected_logps = all_logps[batch['chosen_input_ids'].shape[0]:]
-        return chosen_logps, rejected_logps
+        batch_size = batch['chosen_input_ids'].shape[0]
 
+        if return_z:
+            # dims: [batch size, sequence position index, vocab word index]
+            # note that [:, i, :] gives logits for (i + 1)-th token given all i prior
+            _, seq_len, vocab_size = all_logits.size()
+
+
+            first_response_token_idx = batch['prompt_len'].to(torch.long).repeat(2)  # chosen + rejected
+            gather_idxs = first_response_token_idx.view(-1, 1).expand(-1, vocab_size)
+
+            # [batch_size, vocab_size]
+            first_token_logits = torch.gather(all_logits, 1, gather_idxs.unsqueeze(1)).squeeze(1)
+            print("TOKEN OLOGITS")
+            print(torch.sort(first_token_logits[0], descending=True)[:50])
+            print("TOKEN OLOGITS")
+            print()
+            """
+            beta * log \sum_{i=1}^K exp(1/beta * l_i)
+            where l_i is the logit of the i-th token
+            for the first token generation after the prompt
+            """
+            z = self.config.loss.beta * torch.logsumexp(first_token_logits / self.config.loss.beta, dim=1)
+            print("Z VALUES")
+            print(z[0])
+            print("Z VALUES")
+            chosen_z = z[:batch_size]
+            rejected_z = z[batch_size:]
+
+        all_logps = _get_batch_logps(all_logits, concatenated_batch['concatenated_labels'], average_log_prob=False)
+        chosen_logps = all_logps[:batch_size]
+        rejected_logps = all_logps[batch_size:]
+
+        if return_z:
+            return chosen_logps, rejected_logps, chosen_z, rejected_z
+        return chosen_logps, rejected_logps
 
     def get_batch_metrics(self, batch: Dict[str, Union[List, torch.LongTensor]], loss_config: DictConfig, train=True):
         """Compute the SFT or DPO loss and other metrics for the given batch of inputs."""
@@ -297,8 +335,12 @@ class BasicTrainer(object):
                 local_eval_batch = slice_and_move_batch_for_device(eval_batch, self.rank, self.world_size, self.rank)
 
                 with torch.no_grad():
-                    policy_chosen_logps, policy_rejected_logps = self.concatenated_forward(self.policy, local_eval_batch)
-                    reference_chosen_logps, reference_rejected_logps = self.concatenated_forward(self.reference_model, local_eval_batch)
+                    policy_chosen_logps, policy_rejected_logps, policy_chosen_z, policy_rejected_z = self.concatenated_forward(
+                        self.policy, local_eval_batch, return_z=True
+                    )
+                    reference_chosen_logps, reference_rejected_logps, reference_chosen_z, reference_rejected_z = self.concatenated_forward(
+                        self.reference_model, local_eval_batch, return_z=True
+                    )
 
                     _, chosen_rewards, rejected_rewards = dpo_loss(
                         policy_chosen_logps, policy_rejected_logps, reference_chosen_logps, reference_rejected_logps,
@@ -313,6 +355,8 @@ class BasicTrainer(object):
                             "type": "chosen",
                             "policy_logps": policy_chosen_logps.cpu().numpy().tolist()[i],
                             "reference_logps": reference_chosen_logps.cpu().numpy().tolist()[i],
+                            "policy_z": policy_chosen_z.cpu().numpy().tolist()[i],
+                            "reference_z": reference_chosen_z.cpu().numpy().tolist()[i],
                             "rewards": chosen_rewards.cpu().numpy().tolist()[i],
                             "lengths": local_eval_batch["chosen_len_real"][i],
                             "completion": local_eval_batch["chosen_response_only"][i],
@@ -322,6 +366,8 @@ class BasicTrainer(object):
                             "type": "rejected",
                             "policy_logps": policy_rejected_logps.cpu().numpy().tolist()[i],
                             "reference_logps": reference_rejected_logps.cpu().numpy().tolist()[i],
+                            "policy_z": policy_rejected_z.cpu().numpy().tolist()[i],
+                            "reference_z": reference_rejected_z.cpu().numpy().tolist()[i],
                             "rewards": rejected_rewards.cpu().numpy().tolist()[i],
                             "lengths": local_eval_batch["rejected_len_real"][i],
                             "completion": local_eval_batch["rejected_response_only"][i],
@@ -331,7 +377,8 @@ class BasicTrainer(object):
 
         return pd.DataFrame(results)
 
-    def sample(self, n_per=1):
+    def sample(self, n_per=1, num_beams=None, repetition_penalty=1, top_k=50, penalty_alpha=0.0, temperature=1.0,
+               top_p=1, no_repeat_ngram_size=0):
         """Samples from self.policy over the evaluation set."""
         if n_per != 1:
             print("warning: ignoring n_per sample argument")
@@ -350,20 +397,29 @@ class BasicTrainer(object):
             
                 local_eval_batch = slice_and_move_batch_for_device(eval_batch, self.rank, self.world_size, self.rank)
 
-                samples, _ = self.get_batch_samples(local_eval_batch, use_reference=False)
+                samples, _ = self.get_batch_samples(local_eval_batch, use_reference=False, num_beams=num_beams, temperature=temperature,
+                                                    repetition_penalty=repetition_penalty, top_k=top_k, penalty_alpha=penalty_alpha,
+                                                    top_p=top_p, no_repeat_ngram_size=no_repeat_ngram_size)
                 for prompt, sample in zip(local_eval_batch['prompt'], samples):
                     result[prompt] = sample
                     pbar.update(1)
 
         return result
 
-    def train(self):
+    def train(self, example_counter_start=0, batch_counter_start=0):
         """Begin either SFT or DPO training, with periodic evaluation."""
 
         rank0_print(f'Using {self.config.optimizer} optimizer')
         self.optimizer = getattr(torch.optim, self.config.optimizer)(self.policy.parameters(), lr=self.config.lr)
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lambda step: min(1.0, (step + 1) / (self.config.warmup_steps + 1)))
-    
+
+        if self.config.optimizer_archive:
+            self.load_optimizer_checkpoint(self.config.optimizer_archive)
+            print('loaded optimzer from archive')
+        if self.config.scheduler_archive:
+            self.load_scheduler_checkpoint(self.config.scheduler_archive)
+            print('loaded scheduler from archive')
+
         torch.manual_seed(self.seed)
         np.random.seed(self.seed)
         random.seed(self.seed)
@@ -371,9 +427,11 @@ class BasicTrainer(object):
         if self.config.loss.name == 'dpo':
             self.reference_model.eval()
 
-        self.example_counter = 0
-        self.batch_counter = 0
+        self.example_counter = example_counter_start
+        self.batch_counter = batch_counter_start
         last_log = None
+
+        print(f"starting from example = {self.example_counter}, batch = {self.batch_counter}")
 
         if self.train_iterator is None:
             raise ValueError("No train iterator loaded, cannot train")
@@ -487,6 +545,17 @@ class BasicTrainer(object):
                 rank0_print(f'skipping logging after {self.example_counter} examples to avoid logging too frequently')
             #### END TRAINING ####
 
+    def load_optimizer_checkpoint(self, optimizer_ckpt_path):
+        state_dict = torch.load(optimizer_ckpt_path, map_location='cpu')
+        step, metrics = state_dict['step_idx'], state_dict['metrics']
+        print(f'loading optimizer at step {step} from {optimizer_ckpt_path} with metrics {json.dumps(metrics, indent=2)}')
+        self.optimizer.load_state_dict(state_dict["state"])
+
+    def load_scheduler_checkpoint(self, scheduler_ckpt_path):
+        state_dict = torch.load(scheduler_ckpt_path, map_location='cpu')
+        step, metrics = state_dict['step_idx'], state_dict['metrics']
+        print(f'loading lr scheduler at step {step} from {scheduler_ckpt_path} with metrics {json.dumps(metrics, indent=2)}')
+        self.scheduler.load_state_dict(state_dict["state"])
 
     def clip_gradient(self):
         """Clip the gradient norm of the parameters of a non-FSDP policy."""
@@ -592,6 +661,14 @@ class FSDPTrainer(BasicTrainer):
         
         print('Loaded model on rank', rank)
         dist.barrier()
+
+    def load_optimizer_checkpoint(self, optimizer_ckpt_path):
+        full_osd = None
+        if self.rank == 0:
+            full_osd = torch.load(optimizer_ckpt_path)["state"]
+            print(f"[fsdp:MASTER] loaded optimizer checkpoint from {optimizer_ckpt_path}")
+        sharded_osd = FSDP.scatter_full_optim_state_dict(full_osd, self.policy)
+        print(f"successfully sharded optimizer for fsdp on local rank {self.rank}")
 
     def clip_gradient(self):
         """Clip the gradient norm of the parameters of an FSDP policy, gathering the gradients across all GPUs."""
