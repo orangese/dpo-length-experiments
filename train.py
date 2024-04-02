@@ -145,8 +145,8 @@ def main(config: DictConfig):
 
     if config.model.archive is not None:
         state_dict = torch.load(config.model.archive, map_location='cpu')
-        step, metrics = state_dict['step_idx'], state_dict['metrics']
-        print(f'loading pre-trained weights at step {step} from {config.model.archive} with metrics {json.dumps(metrics, indent=2)}')
+        step_, metrics = state_dict['step_idx'], state_dict['metrics']
+        print(f'loading pre-trained weights at step {step_} from {config.model.archive} with metrics {json.dumps(metrics, indent=2)}')
         policy.load_state_dict(state_dict['state'])
         if config.loss.name == 'dpo' and not config.sample_only and not config.save_as_hf and config.sft_archive is None:
             reference_model.load_state_dict(state_dict['state'])
@@ -187,7 +187,7 @@ def main(config: DictConfig):
             step, metrics = state_dict['step_idx'], state_dict['metrics']
             print(f'loading pre-trained policy weights at step {step} from {config.policy_archive} with metrics {json.dumps(metrics, indent=2)}')
             policy.load_state_dict(state_dict['state'])
-            print('loaded pre-trained weights')
+            print('loaded pre-trained weights on policy for reward computation')
         print(f'not training, just getting rewards (saving to {config.sample_path})')
         worker_rewards(0, 1, config, policy, reference_model)
         return

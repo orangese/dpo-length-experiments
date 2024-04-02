@@ -238,38 +238,73 @@ class BasicTrainer(object):
         batch_size = batch['chosen_input_ids'].shape[0]
 
         if return_z:
+            with torch.no_grad():
+                prompt_logits = model(
+                    batch['prompt_input_ids'],
+                    attention_mask=batch['prompt_attention_mask'],
+                ).logits.to(torch.float32)[:, -1, :]
+                z = self.config.loss.beta * torch.logsumexp(prompt_logits / self.config.loss.beta, dim=1)
+
+            """
             # dims: [batch size, sequence position index, vocab word index]
             # note that [:, i, :] gives logits for (i + 1)-th token given all i prior
             _, seq_len, vocab_size = all_logits.size()
 
-
-            first_response_token_idx = batch['prompt_len'].to(torch.long).repeat(2)  # chosen + rejected
+            # chosen + rejected
+            first_response_token_idx = batch['prompt_len'].to(torch.long).repeat(2) - 2
             gather_idxs = first_response_token_idx.view(-1, 1).expand(-1, vocab_size)
-
+ 
             # [batch_size, vocab_size]
             first_token_logits = torch.gather(all_logits, 1, gather_idxs.unsqueeze(1)).squeeze(1)
+            z = self.config.loss.beta * torch.logsumexp(first_token_logits / self.config.loss.beta, dim=1)
+            chosen_z = z[:batch_size]
+            rejected_z = z[batch_size:]
+            """
+            
+            #curr = torch.gather(concatenated_batch["concatenated_input_ids"], 1, (first_response_token_idx + 1).unsqueeze(1)).squeeze(1)
+            #decoded = self.tokenizer.batch_decode(curr, skip_special_tokens=True)
+            #print(decoded, "NEXT TOKEN")
+            #print(batch["chosen_response_only"])
+            
+            """
+            print()
+            print("PROMPT TKOENS FROM FIRST RESPONSE IDNEX", gather_idxs.shape, first_response_token_idx.shape)
+            print(first_response_token_idx)
+            print(gather_idxs)
+            print(concatenated_batch["concatenated_input_ids"].shape, all_logits.shape)
+            print(self.tokenizer.batch_decode(concatenated_batch["concatenated_input_ids"], skip_special_tokens=True))
+            print(concatenated_batch["concatenated_input_ids"].shape, " CONCAT vs BATCH logits -> ", all_logits.shape)
+            curr = torch.gather(concatenated_batch["concatenated_input_ids"], 1, first_response_token_idx.unsqueeze(1)).squeeze(1)
+            plus_1 = torch.gather(concatenated_batch["concatenated_input_ids"], 1, (first_response_token_idx + 1).unsqueeze(1)).squeeze(1)
+            minus_1 = torch.gather(concatenated_batch["concatenated_input_ids"], 1, (first_response_token_idx - 1).unsqueeze(1)).squeeze(1)
+            ## NOTE: MINUS 1 is the CORRECT ONE (curr = batch['prompt_len'])
+            print(self.tokenizer.batch_decode(curr, skip_special_tokens=True), " CURR")
+            print(self.tokenizer.batch_decode(plus_1, skip_special_tokens=True), " PLUS 1")
+            print(self.tokenizer.batch_decode(minus_1, skip_special_tokens=True), " MINUS 1")
+            print("PROMPT TKOENS FROM FIRST RESPONSE IDNEX")
+            print()
+            print(batch["prompt"], "|", sep="")
+            print(batch["chosen_response_only"], "|", sep="")
+            print("ACGTUAL RESPONSES")
+
             print("TOKEN OLOGITS")
             print(torch.sort(first_token_logits[0], descending=True)[:50])
             print("TOKEN OLOGITS")
             print()
-            """
-            beta * log \sum_{i=1}^K exp(1/beta * l_i)
-            where l_i is the logit of the i-th token
-            for the first token generation after the prompt
-            """
-            z = self.config.loss.beta * torch.logsumexp(first_token_logits / self.config.loss.beta, dim=1)
-            print("Z VALUES")
+            #beta * log \sum_{i=1}^K exp(1/beta * l_i)
+            #where l_i is the logit of the i-th token
+            #for the first token generation after the prompt
+            print("Z VALUES", z.shape)
             print(z[0])
-            print("Z VALUES")
-            chosen_z = z[:batch_size]
-            rejected_z = z[batch_size:]
+            print("Z VALUES", z.shape)
+            """
 
         all_logps = _get_batch_logps(all_logits, concatenated_batch['concatenated_labels'], average_log_prob=False)
         chosen_logps = all_logps[:batch_size]
         rejected_logps = all_logps[batch_size:]
 
         if return_z:
-            return chosen_logps, rejected_logps, chosen_z, rejected_z
+            return chosen_logps, rejected_logps, z
         return chosen_logps, rejected_logps
 
     def get_batch_metrics(self, batch: Dict[str, Union[List, torch.LongTensor]], loss_config: DictConfig, train=True):
@@ -279,7 +314,7 @@ class BasicTrainer(object):
         train_test = 'train' if train else 'eval'
 
         if loss_config.name == 'dpo':
-            policy_chosen_logps, policy_rejected_logps = self.concatenated_forward(self.policy, batch)
+            policy_chosen_logps, policy_rejected_logps, policy_z = self.concatenated_forward(self.policy, batch, return_z=True)
             with torch.no_grad():
                 reference_chosen_logps, reference_rejected_logps = self.concatenated_forward(self.reference_model, batch)
 
@@ -296,11 +331,13 @@ class BasicTrainer(object):
             chosen_rewards = all_gather_if_needed(chosen_rewards, self.rank, self.world_size)
             rejected_rewards = all_gather_if_needed(rejected_rewards, self.rank, self.world_size)
             reward_accuracies = all_gather_if_needed(reward_accuracies, self.rank, self.world_size)
+            policy_z = all_gather_if_needed(policy_z, self.rank, self.world_size)
 
             metrics[f'rewards_{train_test}/chosen'] = chosen_rewards.cpu().numpy().tolist()
             metrics[f'rewards_{train_test}/rejected'] = rejected_rewards.cpu().numpy().tolist()
             metrics[f'rewards_{train_test}/accuracies'] = reward_accuracies.cpu().numpy().tolist()
             metrics[f'rewards_{train_test}/margins'] = (chosen_rewards - rejected_rewards).cpu().numpy().tolist()
+            metrics[f'rewards_{train_test}/z'] = policy_z.cpu().numpy().tolist()
 
             policy_rejected_logps = all_gather_if_needed(policy_rejected_logps.detach(), self.rank, self.world_size)
             metrics[f'logps_{train_test}/rejected'] = policy_rejected_logps.cpu().numpy().tolist()
@@ -335,10 +372,10 @@ class BasicTrainer(object):
                 local_eval_batch = slice_and_move_batch_for_device(eval_batch, self.rank, self.world_size, self.rank)
 
                 with torch.no_grad():
-                    policy_chosen_logps, policy_rejected_logps, policy_chosen_z, policy_rejected_z = self.concatenated_forward(
+                    policy_chosen_logps, policy_rejected_logps, policy_z = self.concatenated_forward(
                         self.policy, local_eval_batch, return_z=True
                     )
-                    reference_chosen_logps, reference_rejected_logps, reference_chosen_z, reference_rejected_z = self.concatenated_forward(
+                    reference_chosen_logps, reference_rejected_logps, reference_z = self.concatenated_forward(
                         self.reference_model, local_eval_batch, return_z=True
                     )
 
@@ -355,8 +392,8 @@ class BasicTrainer(object):
                             "type": "chosen",
                             "policy_logps": policy_chosen_logps.cpu().numpy().tolist()[i],
                             "reference_logps": reference_chosen_logps.cpu().numpy().tolist()[i],
-                            "policy_z": policy_chosen_z.cpu().numpy().tolist()[i],
-                            "reference_z": reference_chosen_z.cpu().numpy().tolist()[i],
+                            "policy_z": policy_z.cpu().numpy().tolist()[i],
+                            "reference_z": reference_z.cpu().numpy().tolist()[i],
                             "rewards": chosen_rewards.cpu().numpy().tolist()[i],
                             "lengths": local_eval_batch["chosen_len_real"][i],
                             "completion": local_eval_batch["chosen_response_only"][i],
@@ -366,8 +403,8 @@ class BasicTrainer(object):
                             "type": "rejected",
                             "policy_logps": policy_rejected_logps.cpu().numpy().tolist()[i],
                             "reference_logps": reference_rejected_logps.cpu().numpy().tolist()[i],
-                            "policy_z": policy_rejected_z.cpu().numpy().tolist()[i],
-                            "reference_z": reference_rejected_z.cpu().numpy().tolist()[i],
+                            "policy_z": policy_z.cpu().numpy().tolist()[i],
+                            "reference_z": reference_z.cpu().numpy().tolist()[i],
                             "rewards": rejected_rewards.cpu().numpy().tolist()[i],
                             "lengths": local_eval_batch["rejected_len_real"][i],
                             "completion": local_eval_batch["rejected_response_only"][i],

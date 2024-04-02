@@ -14,6 +14,7 @@ def get_step(p):
 def is_sft(path):
     return (
         "sft" in path
+        and "no-sft" not in path
         or "b0-a0" in path
         and "sample" not in path
         and "reward" not in path
@@ -147,6 +148,11 @@ if __name__ == "__main__":
         type=float,
         help="filter by a certain alpha value",
         default=None
+    )
+    parser.add_argument(
+        "--no_sft",
+        action="store_true",
+        help="if true, allow reward computation from base model (no sft required)"
     )
     parser.add_argument(
         "--batch_size",
@@ -339,7 +345,7 @@ if __name__ == "__main__":
         for archive_dir, sample_path, ds in ckpt_samples_info:
             print(f"- DIR: {fdir}, CKPT: {archive_dir}, DATASET: {ds}, SAMPLE: {os.path.basename(sample_path)}")
 
-    sft_archive = None
+    sft_archive = "null"
     if args.rewards or args.rewards_on_samples:
         if args.sft_archive is not None:
             sft_archive = args.sft_archive
@@ -355,7 +361,10 @@ if __name__ == "__main__":
                 if not sft_archive.endswith("policy.pt"):
                     sft_archive = os.path.join(sft_archive, "policy.pt")
             except IndexError:
-                raise ValueError("no sft archive found, can't compute rewards")
+                if args.no_sft:
+                    print(f"no sft archive found, defaulting to non-sfted {args.model}")
+                else:
+                    raise ValueError("no sft archive found, can't compute rewards")
         print(f"using {sft_archive} as sft archive")
 
     print("=" * 40)
@@ -366,7 +375,7 @@ if __name__ == "__main__":
             if os.path.exists(sample_path) and not args.overwrite:
                 print(f"skipping existing sample {sample_path}")
                 continue
-            elif sft_archive is not None and (fdir in sft_archive or "b0-a0" in fdir):
+            elif sft_archive != "null" and (fdir in sft_archive or "b0-a0" in fdir):
                 print(f"skipping sft archive {fdir} for reward computation")
                 continue
            

@@ -358,7 +358,8 @@ def get_local_sampled(name: str, silent: bool, cache_dir: str = None):
         if isinstance(v, list):
             v = v[0]  # only take one sample if there are multiple
         response = trim(prompt, v)
-        assert prompt not in response
+        if prompt in response:
+            print("found prompt in response, this is slightly strange but may be ok. check manually")
         responses = [response, response]
         n_responses = len(data[prompt]['responses'])
         data[prompt]['pairs'].append((n_responses, n_responses + 1))
