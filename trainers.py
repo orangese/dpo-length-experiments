@@ -198,12 +198,13 @@ class BasicTrainer(object):
                           top_k: int = 50, penalty_alpha: float = 0.0, temperature: float = 1.0,
                           top_p: float = 1.0, no_repeat_ngram_size: int = 0) -> Tuple[str, str]:
         """Generate samples from the policy (and reference model, if doing DPO training) for the given batch of inputs."""
+        do_sample = temperature != 0
 
         # FSDP generation according to https://github.com/pytorch/pytorch/issues/100069
         ctx = lambda: (FSDP.summon_full_params(self.policy, writeback=False, recurse=False) if 'FSDP' in self.config.trainer else contextlib.nullcontext())
         with ctx():
             policy_output = self.policy.generate(
-                batch['prompt_input_ids'], attention_mask=batch['prompt_attention_mask'], max_length=self.config.max_length, do_sample=True, pad_token_id=self.tokenizer.pad_token_id,
+                batch['prompt_input_ids'], attention_mask=batch['prompt_attention_mask'], max_length=self.config.max_length, do_sample=do_sample, pad_token_id=self.tokenizer.pad_token_id,
                 num_beams=num_beams, repetition_penalty=repetition_penalty, top_k=top_k, penalty_alpha=penalty_alpha, temperature=temperature,
                 no_repeat_ngram_size=no_repeat_ngram_size, top_p=top_p)
 
@@ -211,7 +212,7 @@ class BasicTrainer(object):
             ctx = lambda: (FSDP.summon_full_params(self.reference_model, writeback=False, recurse=False) if 'FSDP' in self.config.trainer else contextlib.nullcontext())
             with ctx():
                 reference_output = self.reference_model.generate(
-                    batch['prompt_input_ids'], attention_mask=batch['prompt_attention_mask'], max_length=self.config.max_length, do_sample=True, pad_token_id=self.tokenizer.pad_token_id,
+                    batch['prompt_input_ids'], attention_mask=batch['prompt_attention_mask'], max_length=self.config.max_length, do_sample=do_sample, pad_token_id=self.tokenizer.pad_token_id,
                     num_beams=num_beams, repetition_penalty=repetition_penalty, top_k=top_k, penalty_alpha=penalty_alpha, temperature=temperature,
                     no_repeat_ngram_size=no_repeat_ngram_size, top_p=top_p)
 
