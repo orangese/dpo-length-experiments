@@ -15,4 +15,4 @@
 source env/bin/activate
 ulimit -n 64000
 
-python -u train.py model.archive={sft_archive} policy_archive={model_archive} eval_batch_size={batch_size} reward_only=true rewards_save_path={sample_path} trainer=BasicTrainer datasets=[{dataset}] n_eval_model_samples=256 exp_name={dataset_id}-rewards debug=true model={model}
+python -u train.py model.archive={sft_archive} policy_archive={model_archive} eval_batch_size={batch_size} reward_only=true rewards_save_path={sample_path} trainer=BasicTrainer datasets=[{dataset}] n_eval_model_samples=256 exp_name={dataset_id}-rewards debug=true model={model} loss.beta={beta} loss.alpha={alpha}

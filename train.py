@@ -142,16 +142,18 @@ def main(config: DictConfig):
         disable_dropout(reference_model)
     else:
         reference_model = None
+    print("done building pretrained models")
 
     if config.model.archive is not None:
         state_dict = torch.load(config.model.archive, map_location='cpu')
         step_, metrics = state_dict['step_idx'], state_dict['metrics']
         print(f'loading pre-trained weights at step {step_} from {config.model.archive} with metrics {json.dumps(metrics, indent=2)}')
-        policy.load_state_dict(state_dict['state'])
+        if not config.reward_only or config.policy_archive is None:
+            policy.load_state_dict(state_dict['state'])
+            print(f'[policy] loaded weights from {config.model.archive}')
         if config.loss.name == 'dpo' and not config.sample_only and not config.save_as_hf and config.sft_archive is None:
             reference_model.load_state_dict(state_dict['state'])
-            print('loaded reference weights (same as config.model.archive)')
-        print('loaded pre-trained weights')
+            print(f'[reference] loaded weights from {config.model.archive}')
 
     if config.sft_archive is not None:
         assert config.optimizer_archive, "use sft_archive for resuming training, so specify optimizer_archive too"
@@ -159,7 +161,7 @@ def main(config: DictConfig):
         step, metrics = state_dict['step_idx'], state_dict['metrics']
         print(f'[reference] loading pre-trained weights at step {step} from {config.sft_archive} with metrics {json.dumps(metrics, indent=2)}')
         reference_model.load_state_dict(state_dict['state'])
-        print('loaded reference weights (from config.sft_archive)')
+        print(f'[reference] loaded reference weights (from {config.sft_archive})')
 
     if config.save_dpo_format is not None:
         print(f"saving with custom dpo format to {config.save_dpo_format}")
@@ -185,10 +187,10 @@ def main(config: DictConfig):
         if config.policy_archive is not None:
             state_dict = torch.load(config.policy_archive, map_location='cpu')
             step, metrics = state_dict['step_idx'], state_dict['metrics']
-            print(f'loading pre-trained policy weights at step {step} from {config.policy_archive} with metrics {json.dumps(metrics, indent=2)}')
+            print(f'[policy] loading pre-trained policy weights at step {step} from {config.policy_archive} with metrics {json.dumps(metrics, indent=2)}')
             policy.load_state_dict(state_dict['state'])
-            print('loaded pre-trained weights on policy for reward computation')
-        print(f'not training, just getting rewards (saving to {config.sample_path})')
+            print(f'[policy] loaded weights on policy for reward computation from {config.policy_archive}')
+        print(f'not training, just getting rewards (saving to {config.rewards_save_path})')
         worker_rewards(0, 1, config, policy, reference_model)
         return
     

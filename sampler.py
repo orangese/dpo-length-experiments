@@ -37,9 +37,9 @@ def get_sample_path(sample_dir, archive, ckpt_dir, ds, do_sample, sampling_param
 
     if args.beta is not None and args.beta != beta:
         if beta != 0 or (not args.rewards and not args.rewards_on_samples):
-            return None
+            return None, None, None
     elif args.alpha is not None and args.alpha != alpha:
-        return None
+        return None, None, None
 
     model = args.model
     ckpt_dir = ckpt_dir.replace("step-", "")
@@ -52,7 +52,7 @@ def get_sample_path(sample_dir, archive, ckpt_dir, ds, do_sample, sampling_param
             path_template += f"__{pname}{pvalue}"
     path_template += f".{ext}"
 
-    return os.path.join(args.sample_dir, path_template)
+    return os.path.join(args.sample_dir, path_template), beta, alpha
 
 
 if __name__ == "__main__":
@@ -299,7 +299,7 @@ if __name__ == "__main__":
        
         continue_ = False
         for ckpt_dir in archive_dirs:
-            ckpt_sample_path = get_sample_path(
+            ckpt_sample_path, beta, alpha = get_sample_path(
                 sample_dir, fdir, ckpt_dir, args.dataset,
                 do_sample=do_sample, sampling_params=sampling_params,
                 use_sampling_params=args.use_sampling_params
@@ -314,7 +314,7 @@ if __name__ == "__main__":
                 ckpt_sample_path = os.path.abspath(os.path.realpath(ckpt_sample_path))
                 dataset = ckpt_sample_path
                 ds_id = f"{args.dataset}_local_samples"
-                ckpt_sample_path = get_sample_path(
+                ckpt_sample_path, beta, alpha = get_sample_path(
                     sample_dir, fdir, ckpt_dir, ds_id,
                     do_sample=False,
                     sampling_params=sampling_params,
@@ -322,11 +322,11 @@ if __name__ == "__main__":
                 )
 
             elif args.rewards_on_samples:
-                print(ckpt_sample_path)
+                print("\nckpt sample path:", ckpt_sample_path)
                 print("rewards_on_samples but no sample path found")
                 continue
  
-            ckpt_samples_info.append((ckpt_dir, ckpt_sample_path, dataset))
+            ckpt_samples_info.append((ckpt_dir, ckpt_sample_path, dataset, beta, alpha))
             n_to_sample += 1
 
         if continue_:
@@ -342,7 +342,7 @@ if __name__ == "__main__":
     print("=" * 40)
     print(f"collected {len(collected)} dirs, {n_to_sample} ckpts to sample from")
     for ckpt_samples_info, fdir in collected:
-        for archive_dir, sample_path, ds in ckpt_samples_info:
+        for archive_dir, sample_path, ds, beta, alpha in ckpt_samples_info:
             print(f"- DIR: {fdir}, CKPT: {archive_dir}, DATASET: {ds}, SAMPLE: {os.path.basename(sample_path)}")
 
     sft_archive = "null"
@@ -371,14 +371,14 @@ if __name__ == "__main__":
     first = True
 
     for ckpt_samples_info, fdir in collected:
-        for archive_dir, sample_path, dataset in ckpt_samples_info:
+        for archive_dir, sample_path, dataset, beta, alpha in ckpt_samples_info:
             if os.path.exists(sample_path) and not args.overwrite:
                 print(f"skipping existing sample {sample_path}")
                 continue
             elif sft_archive != "null" and (fdir in sft_archive or "b0-a0" in fdir):
                 print(f"skipping sft archive {fdir} for reward computation")
                 continue
-           
+          
             model_archive = os.path.join(args.archive_dir, fdir, archive_dir, "policy.pt")
             cmd = template.format(
                 model_archive=model_archive,
@@ -389,6 +389,8 @@ if __name__ == "__main__":
                 max_len=args.max_len,
                 model=args.model,
                 batch_size=args.batch_size,
+                beta=beta,
+                alpha=alpha,
                 **sampling_params
             )
 
